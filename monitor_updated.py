@@ -1,0 +1,6216 @@
+# -*- coding: utf-8 -*-
+# Advanced date/revision review + final PDF dedup guard + undated old-batch send gate (2026-10-27)
+# Conditional stealth (2026-10-28): stealth args + init script only when site.use_stealth_on_block=true
+import base64
+import hashlib
+import html
+import importlib
+import io
+import mimetypes
+import json
+import os
+import re
+import sys
+import time
+import threading
+import socket
+import ssl
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse, urlunparse, unquote, parse_qsl, urlencode
+from urllib.robotparser import RobotFileParser
+
+import pdfplumber
+import requests
+try:
+    import curl_cffi.requests as curl_requests
+except ImportError:
+    curl_requests = None
+try:
+    import cloudscraper
+except ImportError:
+    cloudscraper = None
+from bs4 import BeautifulSoup
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+def _try_import(*names):
+    for name in names:
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    return None
+
+
+fitz = _try_import("pymupdf", "fitz")
+_rapidocr_mod = _try_import("rapidocr_onnxruntime", "rapidocr")
+RapidOCR = getattr(_rapidocr_mod, "RapidOCR", None) if _rapidocr_mod is not None else None
+_RAPIDOCR_AVAILABLE = RapidOCR is not None
+# PaddleOCR intentionally disabled: native Paddle inference crashed the GitHub runner (SIGSEGV).
+_PADDLEOCR_AVAILABLE = False
+pytesseract = _try_import("pytesseract")
+_PIL_Image = _try_import("PIL.Image")
+_TESSERACT_AVAILABLE = pytesseract is not None and _PIL_Image is not None
+try:
+    from playwright.sync_api import sync_playwright, Error as PlaywrightError
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    sync_playwright = None
+    PlaywrightError = Exception
+    _PLAYWRIGHT_AVAILABLE = False
+
+BASE = Path(__file__).resolve().parent
+CONFIG_FILE = BASE / "websites.json"
+STATE_FILE = BASE / "state.json"
+
+FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+FUZZY_DUPLICATE_THRESHOLD = 94
+FUZZY_CROSS_PATH_THRESHOLD = 96
+TELEGRAM_MAX_ATTEMPTS = 100
+TELEGRAM_RETRY_WINDOW_HOURS = 168
+TELEGRAM_RETRY_BASE_MINUTES = 20
+TELEGRAM_RETRY_MAX_MINUTES = 360
+MAX_PDF_SEND_BYTES = 45 * 1024 * 1024
+MAX_HTML_DOWNLOAD_BYTES = 8 * 1024 * 1024
+ALLOW_INSECURE_TLS = os.getenv("ALLOW_INSECURE_TLS", "false").strip().casefold() in {"1", "true", "yes", "on"}
+MAX_GEMINI_PDF_BYTES = 18 * 1024 * 1024
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "8"))
+MAX_PDF_TEXT_CHARS = 4000
+MAX_PDF_RAW_TEXT_CHARS = 8000
+MAX_PDF_ATTEMPTS = 3
+TELEGRAM_SAFE_LIMIT = 4000
+TELEGRAM_CAPTION_LIMIT = 1024
+_RUNTIME_PDF_CACHE_MAX_ITEMS = 20
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "16384"))
+
+OCR_ENABLED = os.getenv("OCR_ENABLED", "true").strip().lower() == "true"
+OCR_DPI = int(os.getenv("OCR_DPI", "250"))
+OCR_MIN_TEXT_CHARS = int(os.getenv("OCR_MIN_TEXT_CHARS", "200"))
+OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "2"))
+_OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "4"))
+MAX_PDF_OCR_SECONDS = int(os.getenv("MAX_PDF_OCR_SECONDS", "120"))
+TESSERACT_ENABLED = os.getenv("TESSERACT_ENABLED", "true").strip().lower() == "true"
+TESSERACT_LANG = os.getenv("TESSERACT_LANG", "hin+eng").strip() or "hin+eng"
+TESSERACT_PSM = os.getenv("TESSERACT_PSM", "6").strip()
+PADDLEOCR_ENABLED = False  # deliberately disabled; use RapidOCR then Tesseract
+GEMINI_PDF_OCR_ENABLED = os.getenv("GEMINI_PDF_OCR_ENABLED", "true").strip().lower() == "true"
+SEND_PDF_ENABLED = os.getenv("SEND_PDF_ENABLED", "true").strip().lower() == "true"
+
+JS_RENDER_ENABLED = os.getenv("JS_RENDER_ENABLED", "true").strip().lower() == "true"
+JS_RENDER_TIMEOUT_MS = int(os.getenv("JS_RENDER_TIMEOUT_MS", "25000"))
+JS_WAIT_UNTIL = os.getenv("JS_WAIT_UNTIL", "domcontentloaded").strip() or "domcontentloaded"
+JS_THIN_TEXT_THRESHOLD = int(os.getenv("JS_THIN_TEXT_THRESHOLD", "200"))
+JS_MAX_RENDER_PER_SITE = max(1, min(100, int(os.getenv("JS_MAX_RENDER_PER_SITE", "60"))))
+JS_WAIT_AFTER_MS = max(0, min(60000, int(os.getenv("JS_WAIT_AFTER_MS", "2500"))))
+JS_SCROLL_TO_BOTTOM = os.getenv("JS_SCROLL_TO_BOTTOM", "false").strip().lower() == "true"
+JS_WAIT_FOR_SELECTOR_DEFAULT = os.getenv("JS_WAIT_FOR_SELECTOR_DEFAULT", "").strip()
+
+NOTIFY_LANGUAGE = os.getenv("NOTIFY_LANGUAGE", "both").strip().lower()
+if NOTIFY_LANGUAGE not in {"both", "hi", "en"}:
+    NOTIFY_LANGUAGE = "both"
+STALE_NOTICE_DAYS = int(os.getenv("STALE_NOTICE_DAYS", "15"))
+OLD_YEAR_HINT_YEARS_BACK = int(os.getenv("OLD_YEAR_HINT_YEARS_BACK", "2"))
+ETAG_CHECK_MAX_AGE_DAYS = int(os.getenv("ETAG_CHECK_MAX_AGE_DAYS", "14"))
+USER_AGENT = os.getenv("MONITOR_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+JS_RENDER_USER_AGENT = os.getenv("JS_RENDER_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+
+STRONG_KEYWORDS = [
+    "admission", "result", "admit card", "answer key", "examination", "exam", "semester", "revaluation", "migration", "certificate", "scholarship", "fee", "syllabus", "timetable", "counselling", "recruitment", "vacancy", "tender", "notice", "notification", "placement", "hostel", "convocation", "registration", "enrollment", "merit", "marksheet", "transcript", "bonafide", "grading", "cgpa", "gpa", "phd", "ph.d", "research", "internship", "challan", "demand draft", "eligibility", "qualification", "provisional", "backlog", "reappear", "supplementary", "marks", "score",
+    "प्रवेश", "परिणाम", "प्रवेश पत्र", "उत्तर कुंजी", "परीक्षा", "सेमेस्टर", "पुनर्मूल्यांकन", "माइग्रेशन", "प्रमाण पत्र", "छात्रवृत्ति", "शुल्क", "पाठ्यक्रम", "समय सारिणी", "काउंसलिंग", "भर्ती", "निविदा", "सूचना", "अधिसूचना", "प्लेसमेंट", "छात्रावास", "दीक्षांत समारोह", "पंजीकरण", "नामांकन", "मेरिट", "अंकतालिका", "अनुसंधान"
+]
+
+_DEVA_DIGIT_TRANS = str.maketrans("०१२३४५६७८९", "0123456789")
+_RUNTIME_PDF_CACHE: Dict[str, bytes] = {}
+_RUNTIME_PDF_CACHE_LOCK = threading.Lock()
+_RUNTIME_PDF_CACHE_MAX_BYTES = max(1 * 1024 * 1024, int(os.getenv("RUNTIME_PDF_CACHE_MAX_BYTES", str(80 * 1024 * 1024))))
+_RUNTIME_PDF_CACHE_BYTES = 0
+
+def _cache_put(key, content):
+    # Required by both PDF processing and Telegram PDF attachment delivery.
+    """Store PDF bytes in a bounded FIFO cache; never let cache errors break a notice run."""
+    global _RUNTIME_PDF_CACHE_BYTES
+    if not key or not isinstance(content, (bytes, bytearray, memoryview)):
+        return
+    value = bytes(content)
+    size = len(value)
+    if size <= 0 or size > _RUNTIME_PDF_CACHE_MAX_BYTES:
+        return
+    try:
+        with _RUNTIME_PDF_CACHE_LOCK:
+            old_value = _RUNTIME_PDF_CACHE.pop(key, None)
+            if old_value is not None:
+                _RUNTIME_PDF_CACHE_BYTES = max(0, _RUNTIME_PDF_CACHE_BYTES - len(old_value))
+            while _RUNTIME_PDF_CACHE and _RUNTIME_PDF_CACHE_BYTES + size > _RUNTIME_PDF_CACHE_MAX_BYTES:
+                _old_key = next(iter(_RUNTIME_PDF_CACHE))
+                _old = _RUNTIME_PDF_CACHE.pop(_old_key, None)
+                if _old is not None:
+                    _RUNTIME_PDF_CACHE_BYTES = max(0, _RUNTIME_PDF_CACHE_BYTES - len(_old))
+            _RUNTIME_PDF_CACHE[key] = value
+            _RUNTIME_PDF_CACHE_BYTES += size
+    except Exception as exc:
+        print(f"[WARN] PDF cache write skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+def _cache_get(key):
+    """Return cached PDF bytes or None; a cache miss must never fail the monitor."""
+    if not key:
+        return None
+    try:
+        with _RUNTIME_PDF_CACHE_LOCK:
+            return _RUNTIME_PDF_CACHE.get(key)
+    except Exception as exc:
+        print(f"[WARN] PDF cache read skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+
+def _cache_clear():
+    global _RUNTIME_PDF_CACHE_BYTES
+    with _RUNTIME_PDF_CACHE_LOCK:
+        _RUNTIME_PDF_CACHE.clear()
+        _RUNTIME_PDF_CACHE_BYTES = 0
+_OCR_CONTENT_CACHE: Dict[str, Tuple[str, str, str]] = {}
+_OCR_CONTENT_CACHE_MAX_ITEMS = 30
+_OCR_CONTENT_LOCK = threading.Lock()
+_GEMINI_API_KEY = ""
+_GEMINI_KEYS_POOL: List[str] = []
+_GEMINI_KEY_INDEX: int = 0
+_GEMINI_DEAD_KEYS: set = set()
+_GEMINI_KEY_LOCK = threading.Lock()
+_MODELS_DISCOVERED: bool = False
+_DYNAMIC_MODELS: List[str] = []
+_DEAD_MODELS: set = set()
+_GEMINI_QUOTA_EXHAUSTED: bool = False
+_RAPIDOCR_INSTANCE = None
+_OCR_INIT_LOCK = threading.Lock()
+_ROBOTS_CACHE = {}
+_TESSERACT_WARNED: bool = False
+_JS_RENDER_COUNT = 0
+_JS_RENDER_COUNT_LOCK = threading.Lock()
+
+_NAV_SIGNALS: Tuple[str, ...] = (
+    "home", "homepage", "about us", "about", "contact us", "contact", "feedback", "site map", "sitemap", "skip to content", "accessibility", "screen reader", "whats new", "what's new", "whatsnew", "latest news", "latest update", "latest updates", "photo gallery", "video gallery", "gallery", "facebook", "twitter", "instagram", "youtube", "whatsapp", "linkedin", "social media", "follow us", "share", "login", "sign in", "sign up", "register", "logout", "main menu", "menu", "navigation",
+    "मुख्य पृष्ठ", "होम", "हमारे बारे में", "संपर्क करें", "संपर्क", "फीडबैक", "साइट मैप", "स्क्रीन रीडर", "महत्वपूर्ण लिंक", "त्वरित लिंक", "नई खबरें", "ताज़ा खबर", "अंतिम अपडेट", "गैलरी", "फोटो गैलरी",
+)
+_NOTICE_SIGNALS: Tuple[str, ...] = (
+    "admission", "result", "admit card", "answer key", "examination", "exam", "revaluation", "migration", "scholarship", "fee", "syllabus", "timetable", "counselling", "recruitment", "vacancy", "tender", "notice", "notification", "placement", "convocation", "registration",
+    "प्रवेश", "परिणाम", "प्रवेश पत्र", "उत्तर कुंजी", "परीक्षा", "पुनर्मूल्यांकन", "छात्रवृत्ति", "शुल्क", "भर्ती", "निविदा", "सूचना",
+)
+_EXPLICIT_DUMP_SIGNALS: Tuple[str, ...] = ("skip to content", "site map", "sitemap", "मुख्य पृष्ठ", "महत्वपूर्ण लिंक", "त्वरित लिंक")
+_STRICT_EARLY_NAV_SIGNALS: Tuple[str, ...] = ("home", "homepage", "whats new", "what's new", "whatsnew", "facebook", "twitter", "instagram", "youtube", "whatsapp", "linkedin", "skip to content", "sitemap", "site map", "मुख्य पृष्ठ", "होम", "साइट मैप")
+_DEVANAGARI_DELIMS = r"[\s\|•\-–—,:;()\[\]{}/\\?!\"'`]"
+_LATIN_LEFT_BOUNDARY = r"(?<![A-Za-z0-9_])"
+_LATIN_RIGHT_BOUNDARY = r"(?![A-Za-z0-9_])"
+_TITLE_STRIP_SIGNALS: Tuple[str, ...] = tuple(sorted(_STRICT_EARLY_NAV_SIGNALS, key=len, reverse=True))
+
+_JS_REQUIRED_MARKERS = ('<div id="root"', '<div id="app"', '<div id="__next"', '<div id="__nuxt"', 'ng-app', 'ng-version', 'data-reactroot', 'data-v-app', 'please enable javascript', 'javascript is disabled', 'you need to enable javascript', 'enable javascript and cookies', 'enable javascript to run', 'loading...', 'loading…', 'जावास्क्रिप्ट सक्षम', 'ng-cloak', 'ng-controller', 'ng-repeat', 'ng-bind', 'ng-view', 'ng-include', 'ng-scope', 'ng-binding', 'angular.js', 'angular.min.js', 'angular-route', 'react.production', 'react-dom.production', 'vue.min.js', 'vue.runtime', 'data-v-', '__next_data__', '_next/static', '__nuxt__', '_nuxt/')
+_JS_PDF_VIEWER_MARKERS = ("pdfjs", "pdf.js", "pdfobject", "viewer.html", "docs.google.com/viewer", "drive.google.com/file", "googleusercontent.com/viewer", "pdfjs-viewer", "web/viewer.html")
+
+_NOTICE_KEYWORDS = [
+    'notice',
+    'notification',
+    'announcement',
+    'circular',
+    'advertisement',
+    'publicity',
+    'exam',
+    'examination',
+    'result',
+    'admit',
+    'form',
+    'tender',
+    'quotation',
+    'bid',
+    'rfp',
+    'eoi',
+    'nit',
+    'recruitment',
+    'vacancy',
+    'appointment',
+    'interview',
+    'apprentice',
+    'syllabus',
+    'curriculum',
+    'date sheet',
+    'date extended',
+    'last date',
+    'due date',
+    'exam date',
+    'schedule',
+    'timetable',
+    'time-table',
+    'time table',
+    'calendar',
+    'fee',
+    'payment',
+    'challan',
+    'merit',
+    'marksheet',
+    'score',
+    'grade',
+    'cgpa',
+    'gpa',
+    'scholarship',
+    'counselling',
+    'counseling',
+    'migration',
+    'certificate',
+    'transcript',
+    'bonafide',
+    'provisional',
+    'registration',
+    'enrollment',
+    'enrolment',
+    'convocation',
+    'placement',
+    'hostel',
+    'prospectus',
+    'semester',
+    'revaluation',
+    'rechecking',
+    'internship',
+    'eligibility',
+    'qualification',
+    'सूचना',
+    'अधिसूचना',
+    'विज्ञापन',
+    'नोटिस',
+    'परीक्षा',
+    'परीक्षा कार्यक्रम',
+    'परीक्षा केंद्र',
+    'परिणाम',
+    'रिजल्ट',
+    'प्रवेश',
+    'प्रवेश पत्र',
+    'भर्ती',
+    'नियुक्ति',
+    'साक्षात्कार',
+    'रिक्त पद',
+    'निविदा',
+    'कोटेशन',
+    'छात्रवृत्ति',
+    'शुल्क',
+    'पाठ्यक्रम',
+    'समय सारिणी',
+    'समय',
+    'कैलेंडर',
+    'मेरिट',
+    'अंकतालिका',
+    'काउंसलिंग',
+    'माइग्रेशन',
+    'प्रमाण पत्र',
+    'पंजीकरण',
+    'नामांकन',
+    'दीक्षांत',
+    'पुनर्मूल्यांकन',
+    'सेमेस्टर',
+    'प्लेसमेंट',
+    'छात्रावास',
+    'notices',
+    'circulars',
+    'public notice',
+    'press release',
+    'office order',
+    'office memorandum',
+    'memo',
+    'ordinance',
+    'resolution',
+    'gazette',
+    'erratum',
+    'addendum',
+    'last date extended',
+    'deadline',
+    'important notice',
+    'urgent notice',
+    'latest notice',
+    'official notice',
+    'notification regarding',
+    'notice regarding',
+    'guidelines',
+    'instructions',
+    'clarification',
+    'withdrawal',
+    'cancellation',
+    'postponed',
+    'postponement',
+    'rescheduled',
+    'deferred',
+    'revised schedule',
+    'public information',
+    'university examination',
+    'annual examination',
+    'semester examination',
+    'term-end examination',
+    'mid semester',
+    'mid-semester',
+    'end semester',
+    'end-semester',
+    'internal examination',
+    'external examination',
+    'theory examination',
+    'practical examination',
+    'written examination',
+    'oral examination',
+    'exam form',
+    'examination form',
+    'form fill-up',
+    'form fill up',
+    'exam fee',
+    'examination fee',
+    'exam centre',
+    'exam center',
+    'centre list',
+    'center list',
+    'centre change',
+    'center change',
+    'exam routine',
+    'examination schedule',
+    'exam programme',
+    'exam program',
+    'datesheet',
+    'routine',
+    'exam instructions',
+    'exam guidelines',
+    'exam postponed',
+    'exam cancelled',
+    'exam rescheduled',
+    'special examination',
+    'back paper',
+    'back examination',
+    'backlog examination',
+    'repeat examination',
+    'supplementary examination',
+    'compartment examination',
+    'improvement examination',
+    'special back examination',
+    'scrutiny',
+    're-checking',
+    're-evaluation',
+    'answer script',
+    'answer book',
+    'copy of answer sheet',
+    'photocopy of answer sheet',
+    'challenge evaluation',
+    'exam attendance',
+    'absentee',
+    'absentee list',
+    'unfair means',
+    'malpractice',
+    'exam duty',
+    'invigilator',
+    'invigilation',
+    'examination department',
+    'controller of examinations',
+    'coe',
+    'result notification',
+    'result declared',
+    'result published',
+    'provisional result',
+    'final result',
+    'revised result',
+    'withheld result',
+    'result withheld',
+    'marks',
+    'mark sheet',
+    'marks statement',
+    'grade card',
+    'grade sheet',
+    'score card',
+    'scorecard',
+    'percentage',
+    'division',
+    'pass list',
+    'fail list',
+    'qualified list',
+    'successful candidates',
+    'provisional merit list',
+    'final merit list',
+    'waitlist',
+    'rank list',
+    'rank card',
+    'cut off',
+    'cutoff',
+    'cut-off marks',
+    'provisional answer key',
+    'final answer key',
+    'model answer',
+    'objection window',
+    'objection against answer key',
+    'admit cards',
+    'entry ticket',
+    'exam ticket',
+    'exam identity card',
+    'registration slip',
+    'attendance sheet',
+    'exam permission',
+    'permission letter',
+    'exam authorization',
+    'candidate list',
+    'eligible candidates',
+    'ineligible candidates',
+    'rejected candidates',
+    'application status',
+    'exam application status',
+    'new admission',
+    'fresh admission',
+    're-admission',
+    'readmission',
+    'online registration',
+    'application form',
+    'application submission',
+    'application deadline',
+    'admission schedule',
+    'admission guidelines',
+    'admission counselling',
+    'seat allotment',
+    'allotment list',
+    'seat matrix',
+    'vacant seats',
+    'spot admission',
+    'mop-up round',
+    'mop up round',
+    'waiting list admission',
+    'document verification',
+    'certificate verification',
+    'physical verification',
+    'entrance test',
+    'entrance examination',
+    'entrance exam',
+    'entrance result',
+    'entrance admit card',
+    'entrance answer key',
+    'eligibility criteria',
+    'eligibility list',
+    'provisional admission',
+    'admission cancellation',
+    'fee refund',
+    'transfer certificate',
+    'character certificate',
+    'academic schedule',
+    'academic session',
+    'academic year',
+    'commencement of classes',
+    'class commencement',
+    'classes begin',
+    'class routine',
+    'class timetable',
+    'course registration',
+    'course structure',
+    'course curriculum',
+    'revised syllabus',
+    'course outline',
+    'course code',
+    'paper code',
+    'credit system',
+    'credit framework',
+    'credit transfer',
+    'academic regulations',
+    'academic ordinance',
+    'learning outcomes',
+    'internal assessment',
+    'continuous assessment',
+    'assignment',
+    'assignments',
+    'project submission',
+    'field work',
+    'fieldwork',
+    'industrial training',
+    'skill enhancement',
+    'value added course',
+    'add-on course',
+    'certificate course',
+    'diploma course',
+    'open elective',
+    'minor course',
+    'major course',
+    'multidisciplinary course',
+    'department notice',
+    'departmental notice',
+    'class suspension',
+    'class postponed',
+    'class rescheduled',
+    'holiday notice',
+    'working days',
+    'teaching days',
+    'academic audit',
+    'undergraduate',
+    'postgraduate',
+    'under graduate',
+    'post graduate',
+    'fyug',
+    'cbl',
+    'semester-i',
+    'semester-ii',
+    'semester-iii',
+    'semester-iv',
+    'semester-v',
+    'semester-vi',
+    'semester-vii',
+    'semester-viii',
+    '1st semester',
+    '2nd semester',
+    '3rd semester',
+    '4th semester',
+    '5th semester',
+    '6th semester',
+    '7th semester',
+    '8th semester',
+    'first semester',
+    'second semester',
+    'third semester',
+    'fourth semester',
+    'fifth semester',
+    'sixth semester',
+    'honours',
+    'hons',
+    'general course',
+    'pass course',
+    'b.a.',
+    'ba',
+    'b.sc.',
+    'bsc',
+    'b.com.',
+    'bcom',
+    'b.c.a.',
+    'bca',
+    'b.b.a.',
+    'bba',
+    'b.ed.',
+    'bed',
+    'b.tech',
+    'btech',
+    'b.pharm',
+    'll.b',
+    'llb',
+    'm.a.',
+    'ma',
+    'm.sc.',
+    'msc',
+    'm.com.',
+    'mcom',
+    'm.c.a.',
+    'mca',
+    'm.ed.',
+    'med',
+    'm.tech',
+    'mtech',
+    'm.pharm',
+    'mba',
+    'm.lib',
+    'mlis',
+    'blis',
+    'b.h.m.s.',
+    'bhms',
+    'bds',
+    'mbbs',
+    'md',
+    'ms',
+    'm.phil',
+    'mphil',
+    'practical exam',
+    'practical routine',
+    'practical schedule',
+    'lab examination',
+    'laboratory examination',
+    'viva voce',
+    'oral test',
+    'project viva',
+    'project evaluation',
+    'thesis submission',
+    'synopsis',
+    'research project',
+    'field study',
+    'internship report',
+    'industrial visit',
+    'clinical posting',
+    'clinical examination',
+    'teaching practice',
+    'lesson plan',
+    'project presentation',
+    'workshop',
+    'seminar',
+    'conference',
+    'symposium',
+    'presentation',
+    'demonstration',
+    'portfolio submission',
+    'research scholar',
+    'research scholars',
+    'phd admission',
+    'ph.d admission',
+    'phd entrance',
+    'phd registration',
+    'phd coursework',
+    'coursework examination',
+    'research entrance test',
+    'research proposal',
+    'research committee',
+    'doctoral committee',
+    'doctoral research',
+    'supervisor allocation',
+    'guide allocation',
+    'research supervisor',
+    'vacancy for phd',
+    'research fellowship',
+    'fellowship application',
+    'jrf',
+    'srf',
+    'csir-net',
+    'ugc-net',
+    'research assistant',
+    'project fellow',
+    'postdoctoral',
+    'post doctoral',
+    'thesis evaluation',
+    'pre-submission seminar',
+    'open defence',
+    'open defense',
+    'viva voce examination',
+    'plagiarism',
+    'ethics committee',
+    'research methodology',
+    'patent',
+    'publication',
+    'research funding',
+    'minor research project',
+    'major research project',
+    'seed grant',
+    'recruitment notification',
+    'job notification',
+    'career',
+    'careers',
+    'employment notice',
+    'staff recruitment',
+    'faculty recruitment',
+    'teaching post',
+    'non-teaching post',
+    'teaching staff',
+    'non-teaching staff',
+    'assistant professor',
+    'associate professor',
+    'professor',
+    'guest faculty',
+    'guest teacher',
+    'visiting faculty',
+    'contractual appointment',
+    'temporary appointment',
+    'permanent appointment',
+    'walk in interview',
+    'interview schedule',
+    'shortlisted candidates',
+    'shortlisting',
+    'selection process',
+    'written test',
+    'skill test',
+    'demo class',
+    'appointment letter',
+    'joining letter',
+    'joining instructions',
+    'joining date',
+    'provisional selection',
+    'final selection',
+    'waiting panel',
+    'panel list',
+    'merit panel',
+    'apprenticeship',
+    'internship vacancy',
+    'pay scale',
+    'age limit',
+    'reservation roster',
+    'application fee',
+    'application correction',
+    'extension of deadline',
+    'tenders',
+    'etender',
+    'request for quotation',
+    'rfq',
+    'request for proposal',
+    'expression of interest',
+    'notice inviting tender',
+    'tender document',
+    'tender fee',
+    'earnest money deposit',
+    'procurement',
+    'purchase notice',
+    'supply order',
+    'work order',
+    'rate contract',
+    'vendor registration',
+    'contract award',
+    'corrigendum tender',
+    'tender extension',
+    'e-auction',
+    'disposal',
+    'scrap sale',
+    'quotation invitation',
+    'pre-bid meeting',
+    'bid opening',
+    'technical evaluation',
+    'financial opening',
+    'purchase committee',
+    'gem portal',
+    'scholarships',
+    'scholarship application',
+    'scholarship renewal',
+    'scholarship verification',
+    'post matric scholarship',
+    'post-matric scholarship',
+    'pre matric scholarship',
+    'merit scholarship',
+    'financial assistance',
+    'financial aid',
+    'student aid',
+    'stipend payment',
+    'education loan',
+    'fee concession',
+    'fee waiver',
+    'fee reimbursement',
+    'tuition fee',
+    'national scholarship portal',
+    'nsp',
+    'e-kalyan',
+    'ekalyan',
+    'minority scholarship',
+    'sc scholarship',
+    'st scholarship',
+    'obc scholarship',
+    'ews scholarship',
+    'divyang scholarship',
+    'disability assistance',
+    'student welfare',
+    'student support',
+    'student grievance',
+    'grievance redressal',
+    'anti-ragging',
+    'anti ragging',
+    'equal opportunity',
+    'counselling centre',
+    'mental health support',
+    'women cell',
+    'internal complaints committee',
+    'sexual harassment prevention',
+    'gender sensitization',
+    'hostel admission',
+    'hostel allotment',
+    'hostel fee',
+    'hostel vacancy',
+    'hostel application',
+    'hostel list',
+    'mess fee',
+    'mess menu',
+    'library notice',
+    'library membership',
+    'library clearance',
+    'no dues',
+    'id card',
+    'bus service',
+    'transport',
+    'parking',
+    'campus facility',
+    'sports trial',
+    'sports selection',
+    'cultural event',
+    'youth festival',
+    'student union',
+    'student election',
+    'campus placement',
+    'placement drive',
+    'pre-placement talk',
+    'training and placement',
+    'alumni registration',
+    'degree distribution',
+    'degree certificate',
+    'provisional certificate',
+    'duplicate certificate',
+    'certificate collection',
+    'medium certificate',
+    'no objection certificate',
+    'noc',
+    'verification of degree',
+    'vice chancellor',
+    'pro vice chancellor',
+    'registrar',
+    'deputy registrar',
+    'assistant registrar',
+    'finance officer',
+    'dean',
+    'dean of students welfare',
+    'head of department',
+    'hod',
+    'department head',
+    'academic council',
+    'executive council',
+    'syndicate',
+    'senate',
+    'board of studies',
+    'faculty board',
+    'selection committee',
+    'meeting notice',
+    'meeting agenda',
+    'minutes of meeting',
+    'committee constituted',
+    'committee notification',
+    'nomination',
+    'charge handover',
+    'administrative order',
+    'delegation of powers',
+    'statute',
+    'regulation',
+    'rules and regulations',
+    'working hours',
+    'office hours',
+    'office closed',
+    'office reopening',
+    'administrative closure',
+    'public holiday',
+    'local holiday',
+    'national holiday',
+    'holiday list',
+    'restricted holiday',
+    'gazetted holiday',
+    'affiliation',
+    'affiliated college',
+    'college affiliation',
+    'affiliation renewal',
+    'recognition',
+    'approval',
+    'accreditation',
+    'naac',
+    'nba',
+    'ugc',
+    'aicte',
+    'ncte',
+    'pci',
+    'bci',
+    'inc',
+    'mci',
+    'nmc',
+    'inspection',
+    'inspection schedule',
+    'compliance',
+    'compliance report',
+    'mandatory disclosure',
+    'annual report',
+    'annual return',
+    'aishe',
+    'institutional data',
+    'iqac',
+    'quality assurance',
+    'internal quality assurance cell',
+    'iqac meeting',
+    'green audit',
+    'gender audit',
+    'energy audit',
+    'statutory committee',
+    'policy document',
+    'self study report',
+    'ssr',
+    'data validation',
+    'affiliation application',
+    'event',
+    'events',
+    'upcoming event',
+    'webinar',
+    'guest lecture',
+    'lecture series',
+    'invited talk',
+    'training programme',
+    'training program',
+    'orientation programme',
+    'orientation program',
+    'induction programme',
+    'induction program',
+    'refresher course',
+    'faculty development programme',
+    'faculty development program',
+    'fdp',
+    'short term course',
+    'capacity building',
+    'awareness programme',
+    'awareness program',
+    'quiz competition',
+    'essay competition',
+    'debate competition',
+    'poster competition',
+    'paper presentation',
+    'call for papers',
+    'call for abstracts',
+    'registration deadline',
+    'event registration',
+    'participation certificate',
+    'convocation ceremony',
+    'foundation day',
+    'annual day',
+    'sports meet',
+    'cultural fest',
+    'fest',
+    'celebration',
+    'commemoration',
+    'memorial lecture',
+    'national conference',
+    'international conference',
+    'सूचनाएँ',
+    'अधिसूचनाएँ',
+    'आधिकारिक सूचना',
+    'महत्वपूर्ण सूचना',
+    'अत्यावश्यक सूचना',
+    'सार्वजनिक सूचना',
+    'कार्यालय आदेश',
+    'अध्यादेश',
+    'संकल्प',
+    'त्रुटि सुधार',
+    'अंतिम तिथि बढ़ाई',
+    'समय सीमा',
+    'परीक्षा स्थगित',
+    'परीक्षा रद्द',
+    'परीक्षा पुनर्निर्धारित',
+    'परीक्षा प्रपत्र',
+    'परीक्षा फॉर्म',
+    'उत्तरमाला',
+    'अंकपत्र',
+    'अंकसूची',
+    'अंक विवरण',
+    'श्रेणी सूची',
+    'पुनर्गणना',
+    'पुनर्जांच',
+    'पूरक परीक्षा',
+    'विशेष परीक्षा',
+    'बैक पेपर',
+    'बैकलॉग परीक्षा',
+    'पुनः नामांकन',
+    'सीट आवंटन',
+    'दस्तावेज सत्यापन',
+    'शैक्षणिक सत्र',
+    'कक्षा संचालन',
+    'कक्षा स्थगित',
+    'कक्षा समय सारिणी',
+    'आंतरिक मूल्यांकन',
+    'प्रायोगिक परीक्षा',
+    'मौखिक परीक्षा',
+    'शोधार्थी',
+    'शोध प्रस्ताव',
+    'शोध प्रबंध',
+    'शोध निर्देशक',
+    'वित्तीय सहायता',
+    'शुल्क माफी',
+    'शुल्क वापसी',
+    'छात्रावास आवंटन',
+    'गैर-शिक्षण कर्मचारी',
+    'अभिरुचि की अभिव्यक्ति',
+    'कार्यादेश',
+    'नीलामी',
+    'उपाधि वितरण',
+    'छात्र कल्याण',
+    'शिकायत निवारण',
+    'रैगिंग निषेध',
+    'महाविद्यालय संबद्धता',
+    'मान्यता',
+    'निरीक्षण',
+    'अनुपालन रिपोर्ट',
+    'संगोष्ठी',
+    'सम्मेलन',
+    'वेबिनार',
+    'प्रशिक्षण कार्यक्रम',
+    'अभिमुखीकरण',
+    'प्रवेश परीक्षा',
+    'प्रवेश परीक्षा परिणाम',
+    'कार्यालय बंद',
+    'कार्यालय खुलने',
+    'विश्वविद्यालय प्रशासन',
+    'कुलपति',
+    'कुलसचिव',
+    'परीक्षा नियंत्रक',
+    'विभागाध्यक्ष',
+    'अधिष्ठाता',
+    'शैक्षणिक परिषद',
+    'कार्यकारी परिषद',
+    'बैठक सूचना',
+    'कार्यसूची',
+    'कार्यवृत्त',
+    'समिति गठन',
+    'आंतरिक शिकायत समिति',
+    'महिला प्रकोष्ठ',
+    'मान्यता प्राप्त',
+    'संबद्धता नवीनीकरण',
+    'exam form fill up',
+    'semester form fill-up',
+    'ug admission',
+    'pg admission',
+    'fyugp semester',
+    'sem exam',
+    'sem result',
+    'admission merit list',
+    'provisional admission list',
+    'revised exam routine',
+    'practical exam routine',
+    'exam form date extended',
+    'admission date extended',
+    'convocation registration',
+    'degree certificate application',
+    'college notice',
+    'university notice',
+    'notice for students',
+    'student notification',
+    'सूचना जारी',
+    'नोटिस जारी',
+    'परीक्षा फॉर्म भरना',
+    'फॉर्म भरने की तिथि',
+    'तिथि में विस्तार',
+    'नामांकन की अंतिम तिथि',
+    'परीक्षा फॉर्म की अंतिम तिथि',
+    'परिणाम जारी',
+    'रिजल्ट जारी',
+    'प्रवेश शुरू',
+    'नामांकन शुरू',
+    'आवेदन आमंत्रित',
+    'आवेदन की अंतिम तिथि',
+    'सूची जारी',
+    'कार्यक्रम जारी',
+    'परीक्षा रूटीन जारी',
+]
+
+
+def _page_requires_js(html_text):
+    if not html_text: return True
+    lower = html_text.lower()
+    for marker in _JS_REQUIRED_MARKERS:
+        if marker in lower: return True
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        for tag in soup(["script", "style", "noscript", "template", "svg"]): tag.decompose()
+        body = soup.body or soup
+        text = body.get_text(" ", strip=True)
+        if len(text) < JS_THIN_TEXT_THRESHOLD: return True
+        anchors = soup.find_all("a", href=True)
+        if len(anchors) < 3 and len(text) < 400: return True
+    except Exception: return True
+    return False
+
+
+def _has_unrendered_angular_templates(html_text):
+    return bool(re.search(r"\{\{[^}]{1,200}\}\}", html_text or ""))
+
+
+def _should_render_js(site, html_text, page_url):
+    mode = str((site or {}).get("js_render", "auto")).strip().lower()
+    if mode == "never": return False
+    if mode == "always": return True
+    fragment = (urlparse(page_url).fragment or "").strip()
+    if fragment.startswith("/") or fragment.startswith("!/"): return True
+    return _page_requires_js(html_text)
+
+
+def _html_looks_like_js_pdf_viewer(html_text):
+    if not html_text: return False
+    lower = html_text.lower()
+    return any(m in lower for m in _JS_PDF_VIEWER_MARKERS)
+
+
+def _render_with_playwright(url, timeout_ms=None, wait_until=None, wait_for_selector=None, wait_after_ms=None, scroll_bottom=False, selector_timeout_ms=None, ignore_https_errors=False, use_stealth=False):
+    if not _PLAYWRIGHT_AVAILABLE or not JS_RENDER_ENABLED: return None, url, "playwright_disabled"
+    timeout_ms = max(1000, int(timeout_ms or JS_RENDER_TIMEOUT_MS))
+    wait_until = wait_until or JS_WAIT_UNTIL
+    if wait_until == "networkidle": wait_until = "domcontentloaded"
+    wait_after_ms = JS_WAIT_AFTER_MS if wait_after_ms is None else wait_after_ms
+    try: wait_after_ms = max(0, min(60000, int(wait_after_ms)))
+    except (TypeError, ValueError): wait_after_ms = JS_WAIT_AFTER_MS
+    selector = str(wait_for_selector or JS_WAIT_FOR_SELECTOR_DEFAULT or "").strip()
+    try: selector_timeout_ms = max(1000, min(90000, int(selector_timeout_ms or 10000)))
+    except (TypeError, ValueError, OverflowError): selector_timeout_ms = 10000
+    try:
+        with sync_playwright() as pw:
+            launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            if use_stealth:
+                launch_args.append("--disable-blink-features=AutomationControlled")
+            browser = pw.chromium.launch(headless=True, args=launch_args)
+            try:
+                context = browser.new_context(user_agent=JS_RENDER_USER_AGENT, locale="en-IN", viewport={"width": 1366, "height": 900}, java_script_enabled=True, ignore_https_errors=bool(ignore_https_errors), extra_http_headers={"Accept-Language": "en-IN,en;q=0.9,hi;q=0.8"})
+                page = context.new_page()
+                if use_stealth:
+                    try:
+                        page.add_init_script("""
+                            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                            Object.defineProperty(navigator, 'languages', {get: () => ['en-IN', 'en', 'hi']});
+                            window.chrome = { runtime: {} };
+                        """)
+                    except Exception as exc:
+                        print(f"[WARN] Stealth init failed: {exc}", file=sys.stderr)
+                page.set_default_timeout(timeout_ms)
+                try: page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                except Exception:
+                    try: page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    except Exception as exc: return None, url, f"playwright_nav_error:{type(exc).__name__}"
+                try: page.wait_for_load_state("networkidle", timeout=min(8000, timeout_ms))
+                except Exception: pass
+                if selector:
+                    try: page.wait_for_selector(selector, state="attached", timeout=min(selector_timeout_ms, timeout_ms))
+                    except Exception: pass
+                if wait_after_ms:
+                    try: page.wait_for_timeout(wait_after_ms)
+                    except Exception: pass
+                if scroll_bottom:
+                    try:
+                        previous_height = -1
+                        for _ in range(4):
+                            height = page.evaluate("() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)")
+                            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                            page.wait_for_timeout(600)
+                            if height == previous_height: break
+                            previous_height = height
+                        page.evaluate("() => window.scrollTo(0, 0)")
+                    except Exception: pass
+                try:
+                    html_content = page.content()
+                    if _has_unrendered_angular_templates(html_content):
+                        page.wait_for_timeout(min(3000, max(500, wait_after_ms)))
+                        html_content = page.content()
+                except Exception as exc: return None, url, f"playwright_content_error:{type(exc).__name__}"
+                if html_content:
+                    global _JS_RENDER_COUNT
+                    with _JS_RENDER_COUNT_LOCK: _JS_RENDER_COUNT += 1
+                return html_content, (page.url or url), "playwright_ok"
+            finally:
+                try: browser.close()
+                except Exception: pass
+    except Exception as exc:
+        print(f"[WARN] Playwright render failed for {url[:80]}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None, url, f"playwright_error:{type(exc).__name__}"
+
+
+def _is_devanagari_str(text: str) -> bool:
+    return any("\u0900" <= c <= "\u097F" and c != "\u0964" for c in (text or ""))
+
+
+def _match_signal(text: str, signal: str) -> bool:
+    if not text or not signal: return False
+    sig = signal.strip().lower()
+    if not sig: return False
+    lower = text.lower()
+    if _is_devanagari_str(sig): pattern = (r"(?:^|" + _DEVANAGARI_DELIMS + r")" + re.escape(sig) + r"(?:$|" + _DEVANAGARI_DELIMS + r")")
+    else: pattern = _LATIN_LEFT_BOUNDARY + re.escape(sig) + _LATIN_RIGHT_BOUNDARY
+    return bool(re.search(pattern, lower))
+
+
+def _count_nav_signals(text: str) -> int:
+    if not text: return 0
+    remaining = text.lower()
+    matched = 0
+    for sig in sorted(_NAV_SIGNALS, key=len, reverse=True):
+        sig_lower = sig.strip().lower()
+        if not sig_lower: continue
+        if _is_devanagari_str(sig_lower): pattern = (r"(?:^|" + _DEVANAGARI_DELIMS + r")" + re.escape(sig_lower) + r"(?:$|" + _DEVANAGARI_DELIMS + r")")
+        else: pattern = _LATIN_LEFT_BOUNDARY + re.escape(sig_lower) + _LATIN_RIGHT_BOUNDARY
+        new_remaining, n = re.subn(pattern, " ", remaining)
+        if n > 0:
+            matched += 1
+            remaining = new_remaining
+    return matched
+
+
+_NOTICE_DOC_URL_HINTS = (
+    "/writereaddata/", "/uploadfile/", "/uploads/", "/downloadfile", "/download_file", "/getfile",
+    "/showfile", "/viewfile", "/filedownload", "/attachment", "/documents/", "/docs/",
+    "/notice/", "/notice_", "/download/",
+)
+
+
+def _is_notice_document_url(url):
+    if not url: return False
+    u = url.lower()
+    if u.endswith(".pdf") or ".pdf?" in u: return True
+    if _looks_like_pdf_url(url): return True
+    try: path = (urlparse(url).path or "").lower()
+    except Exception: return False
+    return any(hint in path for hint in _NOTICE_DOC_URL_HINTS)
+
+
+def _is_rims_non_notice_url(url):
+    """Return True for known RIMS service/navigation URLs, not official notice pages."""
+    try:
+        parsed = urlparse(str(url or ""))
+        host = _normalize_host(parsed.hostname or "")
+        path = (parsed.path or "").rstrip("/").casefold()
+    except Exception:
+        return False
+    if host != "rimsranchi.ac.in":
+        return False
+    # This is the Online OPD registration service shown on the homepage, not a notice.
+    return path.endswith("/onln_reg_sys.php") or path == "onln_reg_sys.php"
+
+def _looks_like_rims_menu_dump(title, url=""):
+    """Detect RIMS global navigation text while preserving real notice titles."""
+    if not title:
+        return False
+    try:
+        host = _normalize_host(urlparse(str(url or "")).hostname or "")
+    except Exception:
+        host = ""
+    if host != "rimsranchi.ac.in":
+        return False
+    text = re.sub(r"\s+", " ", str(title)).casefold()
+    nav_phrases = (
+        "about us", "an introduction", "director administration",
+        "vice-chancellor", "university vice-chancellor", "rti pio",
+        "citizen charter", "on-going projects", "ongoing projects",
+        "how to reach", "academics", "departments faculty",
+        "admission info", "multidisciplinary", "director",
+    )
+    notice_phrases = (
+        "notification", "office order", "recruitment", "advertisement",
+        "examination", "exam result", "result", "admit card",
+        "tender", "corrigendum", "ph.d", "phd", "provisional",
+        "memo no", "letter no", "dated :", "dated:",
+        "सूचना", "अधिसूचना", "भर्ती", "परीक्षा", "परिणाम", "विज्ञापन",
+    )
+    nav_count = sum(1 for phrase in nav_phrases if phrase in text)
+    has_notice = any(phrase in text for phrase in notice_phrases)
+    return nav_count >= 3 and not has_notice
+
+def _should_suppress_rims_candidate(item):
+    """Suppress service links and navigation dumps, but do not discard notice documents."""
+    if not isinstance(item, dict):
+        return False
+    url = str(item.get("url", "") or "")
+    if _is_rims_non_notice_url(url):
+        return True
+    title = clean_text(str(item.get("explicit_title") or item.get("title") or ""), 500)
+    return bool(_looks_like_rims_menu_dump(title, url) and not _is_notice_document_url(url))
+
+
+def _is_nusrl_non_notice_url(url):
+    """Known NUSRL informational page that was incorrectly emitted as an admission notice."""
+    try:
+        parsed = urlparse(str(url or ""))
+        if (parsed.hostname or "").lower().removeprefix("www.") != "nusrlranchi.ac.in":
+            return False
+        path = (parsed.path or "/").rstrip("/").lower() or "/"
+        return path in {"/about-us", "/about", "/life-at-nusrl", "/campus"}
+    except Exception:
+        return False
+
+
+def _looks_like_nusrl_homepage_dump(title, url=""):
+    """Detect NUSRL homepage carousel/menu text, while retaining genuine notice titles."""
+    text = clean_text(str(title or ""), 700).casefold()
+    if not text:
+        return False
+    if _is_nusrl_non_notice_url(url):
+        return True
+    marketing_markers = (
+        "visit nusrl campus", "life at nusrl", "modern classrooms", 
+        "innovative infrastructure", "read more chevron_right", "chevron_right",
+    )
+    marker_count = sum(1 for marker in marketing_markers if marker in text)
+    has_real_notice_title = any(marker in text for marker in (
+        "provisionally eligible candidates", "walk-in interview", "vacancy notification",
+        "recruitment notice", "recruitment cancellation", "ph.d. admission",
+        "phd interview", "admission notification", "notice regarding", "examination schedule",
+        "circular of appointments", "advertisement for", "call for applications",
+    ))
+    return marker_count >= 2 and not has_real_notice_title
+
+
+def _should_suppress_site_noise(item):
+    """Common filter for known false-positive navigation/service candidates."""
+    if not isinstance(item, dict):
+        return False
+    if _should_suppress_rims_candidate(item):
+        return True
+    url = str(item.get("url", "") or "")
+    if _is_nusrl_non_notice_url(url):
+        return True
+    title = clean_text(str(item.get("explicit_title") or item.get("title") or ""), 700)
+    context = clean_text(str(item.get("context") or ""), 700)
+    combined = f"{title} {context}"
+    return _looks_like_nusrl_homepage_dump(combined, url)
+
+
+def _looks_like_menu_dump(title):
+    if not title: return False
+    words = title.split()
+    if len(words) < 4: return False
+    first_words = " ".join(words[:8]).lower()
+    count = sum(1 for sig in _STRICT_EARLY_NAV_SIGNALS if _match_signal(first_words, sig))
+    return count >= 2
+
+
+def _is_garbage_title(title):
+    if not title: return True
+    t = title.strip()
+    if not t: return True
+    if re.search(r"\{\{[^}]{0,200}\}\}", t): return True
+    if re.match(r"^\[(?:ng|data-ng|x-ng)[\w-]*\]", t, re.I) or re.match(r"^\((?:click|change|input|submit|keyup|keydown|mouseover|mouseout)\)", t, re.I) or re.match(r"^\*ng[A-Z][\w-]*", t) or re.match(r"^(?:ng-|data-ng-|x-ng-)[\w-]+", t, re.I): return True
+    if t.casefold() in {"undefined", "null", "nan", "{}", "[]", "{{}}"}: return True
+    stripped = re.sub(r"^[\s\|•\-–—,:;.]+|[\s\|•\-–—,:;.]+$", "", t)
+    if not stripped or len(stripped) < 4: return True
+    if re.match(r"^[\d\s/\-.:()\[\]|,]+$", stripped): return True
+    if _is_generic_title(stripped): return True
+    if _is_language_selector(stripped): return True
+    return False
+
+
+def _filename_to_title(url):
+    try:
+        path = unquote(urlparse(url).path or "")
+        name = path.rstrip("/").rsplit("/", 1)[-1]
+        if not name: return ""
+        if "." in name: name = name.rsplit(".", 1)[0]
+        name = re.sub(r"[_\-]+", " ", name)
+        name = re.sub(r"^(pdf|doc|docx|file|download|notice|document|scan|img|image)\s+", "", name, flags=re.I)
+        name = re.sub(r"\s+", " ", name).strip()
+        if len(name) < 10 or _is_generic_title(name): return ""
+        if re.match(r"^[\d\s/\-.:()\[\]]+$", name): return ""
+        return clean_text(name, 300)
+    except Exception: return ""
+
+
+def _strip_nav_prefix(title):
+    if not title: return title
+    scan_region = title[:400]
+    last_end = 0
+    for sig in _TITLE_STRIP_SIGNALS:
+        sig_lower = sig.lower()
+        if _is_devanagari_str(sig_lower): pattern = re.compile(r"(?:^|" + _DEVANAGARI_DELIMS + r")" + re.escape(sig_lower) + r"(?:$|" + _DEVANAGARI_DELIMS + r")")
+        else: pattern = re.compile(_LATIN_LEFT_BOUNDARY + re.escape(sig_lower) + _LATIN_RIGHT_BOUNDARY)
+        for m in pattern.finditer(scan_region.lower()):
+            if m.end() > last_end: last_end = m.end()
+    if last_end <= 0: return title
+    rest = title[last_end:].lstrip(" \t:-–—|•,;")
+    rest = re.sub(r"^\d{1,2}[./\-]\d{1,2}[./\-]\d{4}[\s:;\-–—]+", "", rest)
+    for marker in (r"\bPublished\s+on\s*:", r"\bPosted\s+on\s*:", r"\bUploaded\s+on\s*:", r"\bDate\s+of\s+Publication\s*:", r"\bप्रकाशित\s*:"):
+        m = re.search(marker, rest, re.I)
+        if m and m.start() >= 15: rest = rest[:m.start()].rstrip(" .;,-")
+    rest = rest.strip()
+    return rest if len(rest) >= 15 else title
+
+
+def _cleanup_menu_dump_title(title, url="", explicit=""):
+    if explicit and not _is_generic_title(explicit) and not _is_language_selector(explicit) and not _looks_like_menu_dump(explicit) and not _is_garbage_title(explicit): return clean_text(explicit, 300)
+    if url and _is_notice_document_url(url):
+        name = _filename_to_title(url)
+        if name: return name
+    if title:
+        stripped = _strip_nav_prefix(title)
+        if stripped and stripped != title and len(stripped) >= 15: return clean_text(stripped, 300)
+    if url:
+        slug = _title_from_url(url, min_len=8)
+        if slug: return slug
+    return title
+
+
+def _resolve_title(item):
+    explicit = clean_text(item.get("explicit_title") or "", 300)
+    anchor = clean_text(item.get("title") or "", 300)
+    context = clean_text(item.get("context") or "", 200)
+    url = item.get("url", "")
+
+    def _ok(v):
+        if not v: return False
+        if v.startswith("http://") or v.startswith("https://"): return False
+        return (not _is_generic_title(v) and not _is_language_selector(v)
+                and not _looks_like_menu_dump(v) and not _looks_like_rims_menu_dump(v, url)
+                and not _is_garbage_title(v))
+    if _ok(explicit): return explicit
+    if _ok(anchor): return anchor
+    for candidate in (explicit, anchor):
+        if candidate and (_looks_like_menu_dump(candidate) or _looks_like_rims_menu_dump(candidate, url) or _is_garbage_title(candidate)):
+            cleaned = _cleanup_menu_dump_title(candidate, url=url, explicit="")
+            if cleaned and cleaned != candidate and _ok(cleaned): return cleaned
+    if (context and not _is_generic_title(context) and not _is_language_selector(context)
+            and not _looks_like_menu_dump(context) and not _looks_like_rims_menu_dump(context, url)):
+        if not (context.startswith("http://") or context.startswith("https://")):
+            return context[:200]
+    slug = _title_from_url(url, min_len=5)
+    if slug: return slug
+    return "Notice"
+
+
+def _get_rapidocr():
+    global _RAPIDOCR_INSTANCE
+    if _RAPIDOCR_INSTANCE is None and _RAPIDOCR_AVAILABLE:
+        with _OCR_INIT_LOCK:
+            if _RAPIDOCR_INSTANCE is not None: return _RAPIDOCR_INSTANCE
+            try:
+                _RAPIDOCR_INSTANCE = RapidOCR(params={"Rec.lang_type": "devanagari"})
+                print("[INFO] RapidOCR initialized with Devanagari model.", file=sys.stderr)
+            except Exception as exc:
+                print(f"[WARN] RapidOCR Devanagari init failed: {exc}", file=sys.stderr)
+                try:
+                    _RAPIDOCR_INSTANCE = RapidOCR()
+                    print("[WARN] Falling back to default RapidOCR.", file=sys.stderr)
+                except Exception as exc2:
+                    print(f"[WARN] RapidOCR default init failed: {exc2}", file=sys.stderr)
+                    return None
+    return _RAPIDOCR_INSTANCE
+
+
+# PaddleOCR code removed intentionally to prevent native SIGSEGV crashes.
+
+def _get_ocr_cache(content_hash):
+    with _OCR_CONTENT_LOCK:
+        return _OCR_CONTENT_CACHE.get(content_hash)
+
+
+def _put_ocr_cache(content_hash, cleaned, raw_for_title, method):
+    with _OCR_CONTENT_LOCK:
+        if len(_OCR_CONTENT_CACHE) >= _OCR_CONTENT_CACHE_MAX_ITEMS:
+            try: _OCR_CONTENT_CACHE.pop(next(iter(_OCR_CONTENT_CACHE)))
+            except (StopIteration, KeyError): pass
+        _OCR_CONTENT_CACHE[content_hash] = (cleaned, raw_for_title, method)
+
+
+def _load_gemini_keys():
+    keys = []
+    seen = set()
+    def add(raw):
+        for part in (raw or "").split(","):
+            key = part.strip()
+            if key and key not in seen:
+                seen.add(key)
+                keys.append(key)
+    add(os.getenv("GEMINI_API_KEYS", ""))
+    for i in range(1, 11): add(os.getenv(f"GEMINI_API_KEY_{i}", ""))
+    add(os.getenv("GEMINI_API_KEY", ""))
+    return keys
+
+
+def _get_next_gemini_key():
+    global _GEMINI_KEY_INDEX
+    with _GEMINI_KEY_LOCK:
+        total = len(_GEMINI_KEYS_POOL)
+        if not total: return None
+        for _ in range(total):
+            idx = _GEMINI_KEY_INDEX % total
+            _GEMINI_KEY_INDEX = (idx + 1) % total
+            key = _GEMINI_KEYS_POOL[idx]
+            if key not in _GEMINI_DEAD_KEYS: return key
+    return None
+
+
+def _has_live_gemini_keys():
+    with _GEMINI_KEY_LOCK: return any(key not in _GEMINI_DEAD_KEYS for key in _GEMINI_KEYS_POOL)
+
+
+def _mark_gemini_key_dead(key, reason="quota exhausted"):
+    if not key: return
+    with _GEMINI_KEY_LOCK:
+        if key in _GEMINI_DEAD_KEYS: return
+        _GEMINI_DEAD_KEYS.add(key)
+        remaining = max(0, len(_GEMINI_KEYS_POOL) - len(_GEMINI_DEAD_KEYS))
+    try: index = _GEMINI_KEYS_POOL.index(key) + 1
+    except ValueError: index = 0
+    print(f"[GEMINI] Key #{index} skipped ({reason}); {remaining} remain.", file=sys.stderr)
+
+
+def _gemini_post_with_rotation(endpoint, payload, timeout):
+    if not _GEMINI_KEYS_POOL: return None, None, "no_keys"
+    attempted = set()
+    last_reason = "all_keys_failed"
+    for _ in range(len(_GEMINI_KEYS_POOL)):
+        key = _get_next_gemini_key()
+        if key is None: return None, None, "all_keys_quota_exhausted"
+        if key in attempted: continue
+        attempted.add(key)
+        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+        try: response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+        except requests.RequestException as exc:
+            last_reason = "network_error"
+            print(f"[WARN] Gemini network error: {type(exc).__name__}", file=sys.stderr)
+            continue
+        if response.status_code == 429:
+            try:
+                err = response.json().get("error", {})
+                msg = str(err.get("message", "")).lower()
+                status = str(err.get("status", "")).upper()
+            except Exception: msg, status = response.text.lower(), ""
+            quota = status == "RESOURCE_EXHAUSTED" or any(term in msg for term in ("quota", "daily limit", "per day", "limit: 0"))
+            if quota:
+                _mark_gemini_key_dead(key, "quota exhausted")
+                last_reason = "quota_exhausted"
+                continue
+            last_reason = "rate_limited"
+            continue
+        if response.status_code in (401, 403):
+            _mark_gemini_key_dead(key, f"HTTP {response.status_code}")
+            last_reason = "key_rejected"
+            continue
+        return response, key, None
+    return None, None, last_reason
+
+
+def _discover_models():
+    global _MODELS_DISCOVERED, _DYNAMIC_MODELS
+    if _MODELS_DISCOVERED: return
+    print("[INFO] Discovering available Gemini models...", file=sys.stderr)
+    try:
+        data = None
+        for _ in range(max(1, len(_GEMINI_KEYS_POOL))):
+            key = _get_next_gemini_key()
+            if key is None: break
+            try:
+                response = requests.get("https://generativelanguage.googleapis.com/v1beta/models", headers={"x-goog-api-key": key}, timeout=15)
+                if response.status_code == 429:
+                    _mark_gemini_key_dead(key, "model-discovery quota")
+                    continue
+                if response.status_code in (401, 403):
+                    _mark_gemini_key_dead(key, f"model-discovery {response.status_code}")
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception: continue
+        if data is None: raise RuntimeError("No configured Gemini key succeeded")
+        valid_models = []
+        for model in data.get("models", []):
+            methods = model.get("supportedGenerationMethods", [])
+            if "generateContent" not in methods: continue
+            model_id = model["name"].replace("models/", "")
+            if any(skip in model_id.lower() for skip in ("embedding", "aqa", "imagen", "veo")): continue
+            valid_models.append(model_id)
+        def _priority(mid):
+            m = mid.lower()
+            if "flash-lite" in m: return 0
+            if "flash" in m: return 1
+            if "pro" in m: return 2
+            return 3
+        _DYNAMIC_MODELS = sorted(valid_models, key=lambda m: (_priority(m), m))
+        if not _DYNAMIC_MODELS: _DYNAMIC_MODELS = list(FALLBACK_MODELS)
+        print(f"[INFO] Discovered {len(_DYNAMIC_MODELS)} models.", file=sys.stderr)
+    except Exception as exc:
+        print(f"[WARN] Model discovery failed: {exc}. Using fallback.", file=sys.stderr)
+        _DYNAMIC_MODELS = list(FALLBACK_MODELS)
+    _MODELS_DISCOVERED = True
+
+
+def _pdf_content_fingerprint(content):
+    if not content: return ""
+    if fitz is not None:
+        try:
+            digest = hashlib.sha256()
+            with fitz.open(stream=content, filetype="pdf") as doc:
+                for page in doc[:MAX_PDF_PAGES]:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(0.75, 0.75), colorspace=fitz.csGRAY, alpha=False)
+                    digest.update(f"{pix.width}x{pix.height}:".encode("ascii"))
+                    digest.update(pix.samples)
+            return "visual-v1:" + digest.hexdigest()
+        except Exception as exc: print(f"[WARN] PDF visual fingerprint failed: {exc}", file=sys.stderr)
+    try:
+        text = _extract_pdf_text_plumber(content)
+        normalized = re.sub(r"\s+", " ", text or "").strip().casefold()
+        if len(normalized) >= 30: return "text-v1:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    except Exception: pass
+    return "bytes-v1:" + hashlib.sha256(content).hexdigest()
+
+
+def _legacy_html_content_hash(title, context):
+    """Read-only compatibility hash for HTML notices saved by state schema v33."""
+    if not title: return ""
+    try:
+        norm_title = re.sub(r"\s+", " ", (title or "").strip().casefold())[:200]
+        norm_context = re.sub(r"\s+", " ", (context or "")[:300].strip().casefold())
+        combined = f"{norm_title}|{norm_context}"
+        if len(combined) < 30: return ""
+        return "html-v1:" + hashlib.sha256(combined.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def _html_content_hash(title, context="", url=""):
+    """Stable HTML-notice identity: normalized title + canonical URL, never volatile page context."""
+    if not title: return ""
+    try:
+        norm_title = re.sub(r"\s+", " ", (title or "").strip().casefold())[:200]
+        # Strip tracking parameters and normalize URL variants so ?utm_source=... does not
+        # create a new notification identity. Keep meaningful query parameters and SPA routes.
+        norm_url = canonical_identity_url(str(url or "").strip()) if url else ""
+        combined = f"{norm_title}|{norm_url}"
+        # URL-less legacy records fall back to the old content hash to avoid a weak title-only key.
+        if not norm_url:
+            return _legacy_html_content_hash(title, context)
+        if len(norm_title) < 8 or len(norm_url) < 12: return ""
+        return "html-v2:" + hashlib.sha256(combined.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def _parse_utc_timestamp(value):
+    if not value: return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError): return None
+
+
+def _telegram_retry_due(record, now=None):
+    now = now or datetime.now(timezone.utc)
+    first_failed = _parse_utc_timestamp(record.get("telegram_first_failed_at"))
+    if first_failed and (now - first_failed).total_seconds() > TELEGRAM_RETRY_WINDOW_HOURS * 3600: return False
+    next_attempt = _parse_utc_timestamp(record.get("telegram_next_attempt_at"))
+    return next_attempt is None or next_attempt <= now
+
+
+def _schedule_telegram_retry(record, now=None):
+    now = now or datetime.now(timezone.utc)
+    if not record.get("telegram_first_failed_at"): record["telegram_first_failed_at"] = now.isoformat()
+    attempts = max(1, int(record.get("telegram_attempts", 1) or 1))
+    delay_minutes = min(TELEGRAM_RETRY_BASE_MINUTES * (2 ** min(attempts - 1, 8)), TELEGRAM_RETRY_MAX_MINUTES)
+    record["telegram_next_attempt_at"] = (now + timedelta(minutes=delay_minutes)).isoformat()
+
+
+MEANINGFUL_FIELDS = {
+    # ─── ADMISSION ───
+    "apply_start_date": [r"(?:apply\s*(?:start|begin|open(?:ing)?|from)|application\s*(?:start|begin|open(?:ing)?)|registration\s*(?:start|begin)|आवेदन\s*(?:प्रारंभ|शुरू|आरंभ|प्रारम्भ)|पंजीकरण\s*(?:प्रारंभ|शुरू))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "last_date": [r"(?:last\s*date|closing\s*date|apply\s*(?:by|till|before)|deadline|due\s*date|अंतिम\s*तिथि|आख़िरी\s*तारीख़|अंतिम\s*तारीख)\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "admission_last_date": [r"(?:admission\s*(?:last\s*date|closing\s*date)|प्रवेश\s*(?:अंतिम|आख़िरी)\s*(?:तिथि|तारीख़))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "counselling_date": [r"(?:counsell?ing\s*(?:date|schedule|round)|काउंसलिंग\s*(?:तिथि|दिनांक|कार्यक्रम))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    # ─── RESULT ───
+    "result_date": [r"(?:result\s*(?:date|declared|published)|परिणाम\s*(?:तिथि|घोषित|जारी)|रिजल्ट\s*(?:जारी|घोषित))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "next_stage_date": [r"(?:next\s*stage\s*date|अगले\s*चरण\s*की\s*तिथि)\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "rechecking_last_date": [r"(?:re-?check(?:ing)?\s*(?:last\s*date|deadline)|रीचेकिंग\s*(?:अंतिम|आख़िरी)\s*(?:तिथि|तारीख़))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    # ─── ADMIT CARD ───
+    "download_start_date": [r"(?:download\s*(?:start|begin|from)|डाउनलोड\s*(?:प्रारंभ|शुरू))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "download_last_date": [r"(?:download\s*(?:last\s*date|deadline|till|upto|up\s*to)|डाउनलोड\s*(?:अंतिम|आख़िरी)\s*(?:तिथि|तारीख़))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "admit_card_date": [r"(?:admit\s*card\s*(?:date|download|available)|प्रवेश\s*पत्र\s*(?:तिथि|डाउनलोड|उपलब्ध))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "exam_date": [r"(?:exam(?:ination)?\s*date|परीक्षा\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "exam_time": [r"(?:exam(?:ination)?\s*time|परीक्षा\s*(?:समय|टाइम))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "reporting_time": [r"(?:reporting\s*time|रिपोर्टिंग\s*(?:समय|टाइम))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    # ─── ANSWER KEY ───
+    "objection_start_date": [r"(?:objection\s*(?:start|begin|from|window\s*open)|आपत्ति\s*(?:प्रारंभ|शुरू))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "objection_last_date": [r"(?:objection\s*(?:last\s*date|deadline|closing)|आपत्ति\s*(?:अंतिम|आख़िरी)\s*(?:तिथि|तारीख़))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    # ─── EXAM SCHEDULE / TIMETABLE ───
+    "exam_start_date": [r"(?:exam(?:ination)?\s*(?:start|begin|commence)|परीक्षा\s*(?:प्रारंभ|शुरू|आरंभ))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "exam_end_date": [r"(?:exam(?:ination)?\s*(?:end|conclude|finish)|परीक्षा\s*(?:समाप्त|ख़त्म|अंत))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "practical_dates": [r"(?:practical\s*(?:exam|date|schedule)|प्रायोगिक\s*(?:परीक्षा|तिथि))\s*[:：-]?\s*([^\n,;]{1,80})"],
+    "viva_dates": [r"(?:viva\s*(?:voce|date|schedule)|वाइवा\s*(?:तिथि|कार्यक्रम))\s*[:：-]?\s*([^\n,;]{1,80})"],
+    # ─── REVALUATION ───
+    "revaluation_start_date": [r"(?:revaluation\s*(?:start|begin|from)|पुनर्मूल्यांकन\s*(?:प्रारंभ|शुरू))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "revaluation_last_date": [r"(?:revaluation\s*(?:last\s*date|deadline|closing)|पुनर्मूल्यांकन\s*(?:अंतिम|आख़िरी)\s*(?:तिथि|तारीख़))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    # ─── FEE ───
+    "fee_last_date": [r"(?:fee\s*(?:submission|payment)?\s*(?:last\s*date|deadline)|last\s*date\s*(?:to|for)\s*pay(?:ment)?|शुल्क\s*(?:जमा|भुगतान)\s*(?:अंतिम|आख़िरी)\s*(?:तिथि|तारीख़))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    # ─── ACADEMIC CALENDAR ───
+    "event_date": [r"(?:event\s*(?:date|on)|कार्यक्रम\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "effective_from": [r"(?:effective\s*from|with\s*effect\s*from|प्रभावी\s*(?:तिथि|से))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "effective_date": [r"(?:effective\s*date|प्रभावी\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    # ─── PLACEMENT ───
+    "drive_date": [r"(?:drive\s*(?:date|on)|placement\s*drive|प्लेसमेंट\s*ड्राइव|ड्राइव\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    # ─── TENDER ───
+    "tender_issue_date": [r"(?:tender\s*(?:issue|issued|publish(?:ed)?|publication)\s*date|निविदा\s*(?:जारी|प्रकाशन)\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "tender_submission_last_date": [r"(?:(?:tender|bid)\s*submission\s*(?:last|closing|due)\s*date|last\s*date\s*(?:of|for)\s*(?:tender|bid)\s*submission|bid\s*(?:submission|submit)\s*(?:last|closing|due)|निविदा\s*जमा\s*(?:अंतिम|आख़िरी)\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "tender_opening_date": [r"(?:(?:tender|bid)\s*opening\s*date|date\s*of\s*(?:tender|bid)\s*opening|निविदा\s*खोलने\s*(?:की\s*)?(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "submission_last_date": [r"(?:(?:document|application)\s*submission\s*(?:last|closing)\s*date|जमा\s*(?:अंतिम|आख़िरी)\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "opening_date": [r"(?:opening\s*date|खोलने\s*की\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    # ─── VACANCY / RECRUITMENT ───
+    "interview_date": [r"(?:interview\s*(?:date|on|schedule)|साक्षात्कार\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "vacancy_count": [r"(?:total\s*vacanc(?:y|ies)|no\.\s*of\s*vacanc(?:y|ies)|vacancies|पदों\s*की\s*संख्या|कुल\s*पद|रिक्त\s*पद)\s*[:：-]?\s*([\d,]+)"],
+    # ─── GENERAL ───
+    "issue_date": [r"(?:issue\s*date|issued\s*on|publish(?:ed)?\s*(?:on|date)|publication\s*date|notice\s*date|जारी\s*(?:तिथि|दिनांक)|प्रकाशन\s*(?:तिथि|दिनांक))\s*[:：-]?\s*([^\n,;]{1,50})"],
+    "age_limit": [r"(?:age\s*limit|आयु\s*सीमा)\s*[:：-]?\s*([^\n,;]{1,70})"],
+    "eligibility": [r"(?:eligibility|educational\s*qualification|योग्यता|शैक्षणिक\s*योग्यता)\s*[:：-]?\s*([^\n;]{1,120})"],
+}
+
+
+def extract_meaningful_fields(text):
+    source = clean_text(text or "", 12000).casefold()
+    found = {}
+    for field, patterns in MEANINGFUL_FIELDS.items():
+        for pattern in patterns:
+            match = re.search(pattern, source, flags=re.I)
+            if match:
+                value = re.sub(r"\s+", " ", match.group(1)).strip(" .:-")
+                if value:
+                    found[field] = value
+                    break
+    return found
+
+
+def meaningful_change_details(old_text, new_text):
+    old_fields = extract_meaningful_fields(old_text)
+    new_fields = extract_meaningful_fields(new_text)
+    changed = {k: {"old": old_fields.get(k), "new": new_fields.get(k)} for k in set(old_fields) | set(new_fields) if old_fields.get(k) != new_fields.get(k)}
+    if not changed:
+        old_norm = re.sub(r"\s+", " ", (old_text or "").casefold()).strip()
+        new_norm = re.sub(r"\s+", " ", (new_text or "").casefold()).strip()
+        if old_norm and new_norm and old_norm != new_norm:
+            ratio = fuzz.ratio(old_norm[:2000], new_norm[:2000])
+            if ratio < 78 and Levenshtein.distance(old_norm[:2000], new_norm[:2000]) >= 30:
+                changed["substantive_text"] = {"old": old_norm[:160], "new": new_norm[:160]}
+    return changed
+
+
+def _meaningful_metadata_change(old_title, new_title, old_context, new_context):
+    old_title_norm = re.sub(r"\s+", " ", (old_title or "").casefold()).strip()
+    new_title_norm = re.sub(r"\s+", " ", (new_title or "").casefold()).strip()
+    if old_title_norm and old_title_norm == new_title_norm:
+        # Same title: ignore arbitrary context churn (sidebar, ticker, visitor count,
+        # page timestamps). Reprocess only when a known meaningful notice field changes.
+        old_fields = extract_meaningful_fields("\n".join([old_title or "", old_context or ""]))
+        new_fields = extract_meaningful_fields("\n".join([new_title or "", new_context or ""]))
+        return any(old_fields.get(k) != new_fields.get(k) for k in set(old_fields) | set(new_fields))
+    details = meaningful_change_details("\n".join([old_title or "", old_context or ""]), "\n".join([new_title or "", new_context or ""]))
+    if details: return True
+    old_t = re.sub(r"[^\w]+", " ", (old_title or "").casefold()).strip()
+    new_t = re.sub(r"[^\w]+", " ", (new_title or "").casefold()).strip()
+    if old_t and new_t and old_t != new_t:
+        distance = Levenshtein.distance(old_t, new_t)
+        ratio = fuzz.ratio(old_t, new_t)
+        if distance >= 8 and ratio < 92: return True
+    old_c = re.sub(r"\s+", " ", (old_context or "").casefold()).strip()
+    new_c = re.sub(r"\s+", " ", (new_context or "").casefold()).strip()
+    if old_c and new_c and old_c != new_c:
+        distance = Levenshtein.distance(old_c, new_c)
+        ratio = fuzz.ratio(old_c, new_c)
+        if distance >= 100 and ratio < 55: return True
+    return False
+
+
+def baseline_can_complete(scan_success, errors, max_errors=3):
+    if isinstance(errors, str): error_count = 1 if errors.strip() else 0
+    else:
+        try: error_count = len(errors or [])
+        except TypeError: error_count = 1 if errors else 0
+    try: limit = max(0, min(50, int(max_errors)))
+    except (TypeError, ValueError, OverflowError): limit = 3
+    return bool(scan_success) and error_count <= limit
+
+
+def add_review_item(state, record, reason, details=None):
+    queue = state.setdefault("review_queue", {})
+    key = hashlib.sha256((record.get("site_id", "") + "|" + record.get("url", "")).encode("utf-8")).hexdigest()
+    previous = queue.get(key, {})
+    queue[key] = {
+        "site_id": record.get("site_id"), "site_name": record.get("site_name"),
+        "url": record.get("url"), "title": record.get("title"),
+        "reason": clean_text(str(reason), 500),
+        "detected_dates": extract_meaningful_fields("\n".join([record.get("title", ""), record.get("context", ""), record.get("pdf_text", "")])),
+        "gemini_output": record.get("classification"),
+        "diff_summary": details or record.get("meaningful_diff", {}),
+        "status": "open", "retry_count": int(previous.get("retry_count", 0)) + (1 if previous else 0),
+        "first_seen": previous.get("first_seen", utc_now()), "updated_at": utc_now(),
+    }
+
+
+def _check_url_changed(session, url, record, verify_ssl=True):
+    try:
+        head = session.head(url, timeout=8, allow_redirects=True, verify=verify_ssl)
+        new_etag = head.headers.get("etag")
+        new_lm = head.headers.get("last-modified")
+        old_etag = record.get("etag")
+        old_lm = record.get("last_modified")
+        changed = False
+        if new_etag and old_etag and new_etag != old_etag: changed = True
+        elif new_lm and old_lm and new_lm != old_lm: changed = True
+        if record.get("is_pdf"):
+            try:
+                with session.get(url, timeout=20, allow_redirects=True, stream=True, verify=verify_ssl) as response:
+                    if response.status_code < 400:
+                        chunks = []
+                        total = 0
+                        prefix = b""
+                        too_large = False
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            if not chunk: continue
+                            if len(prefix) < 8: prefix += chunk[:8 - len(prefix)]
+                            total += len(chunk)
+                            if total > MAX_PDF_SEND_BYTES:
+                                too_large = True
+                                break
+                            chunks.append(chunk)
+                        if not too_large and prefix.startswith(b"%PDF"):
+                            content = b"".join(chunks)
+                            new_hash = _pdf_content_fingerprint(content)
+                            old_hash = record.get("pdf_hash")
+                            old_kind = record.get("pdf_hash_kind")
+                            new_kind = new_hash.split(":", 1)[0]
+                            if old_hash and old_kind == new_kind: changed = new_hash != old_hash
+                            elif old_hash and not old_kind: changed = False
+                            record["pdf_hash"] = new_hash
+                            record["pdf_hash_kind"] = new_kind
+            except Exception as exc: print(f"[WARN] PDF hash check failed for {url[:80]}: {exc}", file=sys.stderr)
+        return changed, new_etag, new_lm
+    except Exception: return False, None, None
+
+
+_NON_NOTICE_URL_PATTERNS = [
+    re.compile(r"/page/\d+/?$", re.I), re.compile(r"/page/?$", re.I), re.compile(r"/notice_category(/|$)", re.I),
+    re.compile(r"/notice-category(/|$)", re.I), re.compile(r"/document-category(/|$)", re.I), re.compile(r"/document_category(/|$)", re.I),
+    re.compile(r"/past-notices(/|$)", re.I), re.compile(r"/past_notices(/|$)", re.I), re.compile(r"/whats-new(/|$)", re.I),
+    re.compile(r"/whats_new(/|$)", re.I), re.compile(r"/category/[^/]+/?$", re.I), re.compile(r"/tag/[^/]+/?$", re.I),
+    re.compile(r"/archive/?$", re.I), re.compile(r"/directory/?$", re.I), re.compile(r"/about-district/?$", re.I),
+    re.compile(r"/department/?$", re.I), re.compile(r"/search(/|$)", re.I), re.compile(r"[?&]page=\d+", re.I),
+    re.compile(r"[?&]paged=\d+", re.I), re.compile(r"/(hi|en|hn|ur|bn|ta|te|mr|gu|kn|ml|pa|or|as)(/|$).*(past[-_]?notices|whats[-_]?new|archive|category|notice[-_]?category|document[-_]?category|search)", re.I),
+    re.compile(r"/notice/(login|adminlogin|stdlogin|admin|auth|register)(/|$)", re.I),
+    re.compile(r"/(login|signin|sign-in|register|logout)(/|$)", re.I),
+]
+_ARCHIVE_URL_PATTERNS = [
+    re.compile(r"/past-notices(/|$)", re.I), re.compile(r"/past_notices(/|$)", re.I), re.compile(r"/whats-new(/|$)", re.I),
+    re.compile(r"/whats_new(/|$)", re.I), re.compile(r"/notice_category(/|$)", re.I), re.compile(r"/notice-category(/|$)", re.I),
+    re.compile(r"/document-category(/|$)", re.I), re.compile(r"/document_category(/|$)", re.I), re.compile(r"/archive/?$", re.I),
+    re.compile(r"/page/\d+/?$", re.I), re.compile(r"/page/?$", re.I), re.compile(r"[?&]page=\d+", re.I), re.compile(r"[?&]paged=\d+", re.I),
+]
+_GENERIC_TITLES = {
+    "archive", "more", "more...", "more…", "more....", "»", "«", ">>", "<<", "next", "previous", "prev",
+    "back", "forward", "home", "contact", "about", "about us", "contact us", "read more", "view more",
+    "view all", "show more", "see more", "load more", "learn more", "continue reading", "read more chevron_right", "view all chevron_right",
+    "chevron_right", "chevron_left", "arrow_forward", "arrow_back", "click here", "here", "link",
+    "department name", "name of department", "department", "dept", "designation", "post name", "post", "employee name", "father name",
+    "address", "email", "phone", "mobile", "date of birth", "dob", "gender", "category", "serial number", "sr no", "sr. no", "s.no",
+    "sl no", "sl. no", "roll number", "roll no", "registration no", "registration number", "enrollment no", "enrollment number",
+    "qualification", "status", "remarks", "pincode", "pin code", "notices & announcements", "notices and announcements", "tenders", "placement statistics", "research cluster",
+}
+_LANGUAGE_SELECTOR_TITLES = {
+    "hindi", "english", "santali", "santhali", "urdu", "bengali", "bangla", "odia", "oriya", "tamil", "telugu", "marathi",
+    "gujarati", "kannada", "malayalam", "punjabi", "assamese", "kashmiri", "konkani", "manipuri", "nepali", "sanskrit",
+    "sindhi", "bodo", "dogri", "maithili", "rajasthani", "हिन्दी", "हिंदी", "हिन्दी में", "हिंदी में", "अंग्रेजी", "अंग्रेज़ी", "अंग्रेजी में",
+    "संताली", "संथाली", "उर्दू", "बंगाली", "बांग्ला", "उड़िया", "ओड़िया", "तमिल", "तेलुगु", "मराठी", "गुजराती", "कन्नड़", "मलयालम", "पंजाबी", "असमिया",
+    "कश्मीरी", "कोकणी", "मणिपुरी", "नेपाली", "संस्कृत", "सिंधी", "बोडो", "डोगरी", "मैथिली", "राजस्थानी",
+}
+_EMPTY_PAGE_PHRASES = ["sorry, no notice matched", "no notice matched this category", "no records found", "no data found", "no notices found", "no results found"]
+_TITLE_LABEL_RE = re.compile(r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：–—-]\s*$", re.IGNORECASE)
+_TITLE_INLINE_RE = re.compile(r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：–—-]\s*(.+?)\s*$", re.IGNORECASE)
+_TITLE_LABEL_STRICT_RE = re.compile(r"^\s*(?:document\s+title|title|subject|शीर्षक|विषय|दस्तावेज़\s*शीर्षक)\s*[:：–—-]?\s*$", re.IGNORECASE)
+
+
+def _extract_explicit_title(soup):
+    def clean_value(value):
+        value = clean_text(value or "", 500)
+        if len(value) < 15 or _is_generic_title(value) or _is_language_selector(value): return ""
+        if _TITLE_LABEL_RE.match(value): return ""
+        if _looks_like_menu_dump(value): return ""
+        return value
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all(["th", "td"], recursive=False)
+        if len(cells) >= 2:
+            label = clean_text(cells[0].get_text(" ", strip=True), 100)
+            if _TITLE_LABEL_STRICT_RE.match(label):
+                value = clean_value(cells[1].get_text(" ", strip=True))
+                if value: return value
+    for dt in soup.find_all("dt"):
+        label = clean_text(dt.get_text(" ", strip=True), 100)
+        if _TITLE_LABEL_STRICT_RE.match(label):
+            dd = dt.find_next_sibling("dd")
+            if dd:
+                value = clean_value(dd.get_text(" ", strip=True))
+                if value: return value
+    for label_node in soup.find_all(["b", "strong", "label"]):
+        label = clean_text(label_node.get_text(" ", strip=True), 100)
+        if not _TITLE_LABEL_STRICT_RE.match(label): continue
+        sibling = label_node.find_next_sibling()
+        if sibling:
+            value = clean_value(sibling.get_text(" ", strip=True))
+            if value: return value
+        parent = label_node.parent
+        if parent:
+            combined = clean_text(parent.get_text(" ", strip=True), 700)
+            m = _TITLE_INLINE_RE.match(combined)
+            if m:
+                value = clean_value(m.group(1))
+                if value: return value
+    for node in soup.find_all(["td", "th", "dd", "p", "div", "li", "span"]):
+        raw = node.get_text(" ", strip=True)
+        if len(raw) > 700: continue
+        text_value = clean_text(raw, 700)
+        m = _TITLE_INLINE_RE.match(text_value)
+        if m:
+            value = clean_value(m.group(1))
+            if value: return value
+    return ""
+
+
+def _is_navigation_url(url):
+    try:
+        parsed = urlparse(url)
+        fragment = (parsed.fragment or "").strip()
+        if (fragment.startswith("/") or fragment.startswith("!/")) and len(fragment) > 2: return False
+        target = (parsed.path or "") + ("?" + parsed.query if parsed.query else "")
+    except Exception: return False
+    if _is_rims_non_notice_url(url):
+        return True
+    for pat in _NON_NOTICE_URL_PATTERNS:
+        if pat.search(target): return True
+    return False
+
+
+def _is_archive_url(url):
+    try:
+        parsed = urlparse(url)
+        target = (parsed.path or "") + ("?" + parsed.query if parsed.query else "")
+    except Exception: return False
+    for pat in _ARCHIVE_URL_PATTERNS:
+        if pat.search(target): return True
+    return False
+
+
+def _is_generic_title(title):
+    t = re.sub(r"\s+", " ", (title or "").strip().casefold())
+    if not t: return True
+    if t in _GENERIC_TITLES: return True
+    if len(t.split()) <= 3 and re.fullmatch(r"(?:[\w.-]+\s+)?(?:name|no|no\.|number|id|code|address|email|phone|mobile|dob|status|remarks|qualification|designation|department|dept|category|gender|pincode|serial|roll|registration|enrollment)", t, flags=re.UNICODE): return True
+    if len(t) > 50 and re.match(r"^(?:national|indian)\s+institute\s+of\s+", t): return True
+    if len(t) > 40 and re.match(r"^(?:address|campus address|contact address|postal address|administrative office address)\b", t) and re.search(r"(?:pincode|pin\s*code|\b(?:81|82|83|84|85)\d{4}\b)", t): return True
+    ui_only = re.sub(r"\s+(?:chevron_(?:right|left|up|down)|arrow_(?:forward|back|right|left)|keyboard_arrow_(?:right|left|up|down)|east|west|north|south)+$", "", t).strip()
+    if ui_only in _GENERIC_TITLES: return True
+    if re.match(r"^(?:read|view|show|see|load|continue|learn)\s+(?:more|all|less|next)(?:\s+(?:chevron_\w+|arrow_\w+|east|west|north|south))*$", t): return True
+    compact = re.sub(r"[^\w]+", "", t, flags=re.UNICODE)
+    if not compact or len(compact) <= 2: return True
+    if t.isdigit() and len(t) <= 3: return True
+    return False
+
+
+def _is_language_selector(title):
+    t = (title or "").strip().lower()
+    if not t: return False
+    if t in _LANGUAGE_SELECTOR_TITLES: return True
+    for sep in (" - ", " | ", " / ", "(", ")"):
+        for part in t.split(sep):
+            p = part.strip()
+            if p and p in _LANGUAGE_SELECTOR_TITLES and len(t) <= 40: return True
+    return False
+
+
+def _is_empty_page_text(html_text):
+    if not html_text: return False
+    sample = html_text[:8000].lower()
+    return any(phrase in sample for phrase in _EMPTY_PAGE_PHRASES)
+
+
+def _title_from_url(url, min_len=8):
+    try: path = unquote(urlparse(url).path or "")
+    except Exception: return ""
+    slug = path.rstrip("/").rsplit("/", 1)[-1]
+    if not slug or slug.lower().endswith(".pdf"): slug = slug.rsplit(".", 1)[0] if "." in slug else slug
+    slug = re.sub(r"[-_]+", " ", slug)
+    slug = re.sub(r"\s+", " ", slug).strip()
+    slug = clean_text(slug, 200)
+    if len(slug) < min_len: return ""
+    if _is_generic_title(slug): return ""
+    return slug
+
+
+_PDF_URL_HINTS = ("downloadfile", "download_file", "downloadpdf", "download_pdf", "showpdf", "viewpdf", "getpdf", "filedownload", "getfile")
+
+
+def _looks_like_pdf_url(url):
+    if not url: return False
+    u = url.lower()
+    if ".pdf" in u: return True
+    try: path = (urlparse(url).path or "").lower()
+    except Exception: return False
+    if any(kw in path for kw in _PDF_URL_HINTS): return True
+    return False
+
+
+def _looks_like_pdf_response(content, content_type, url=""):
+    if not content: return False
+    ct = (content_type or "").lower()
+    if "application/pdf" in ct: return True
+    if content[:4] == b"%PDF": return True
+    if "application/octet-stream" in ct and content[:5] == b"%PDF-": return True
+    if ("download" in ct or "x-download" in ct) and content[:4] == b"%PDF": return True
+    if _looks_like_pdf_url(url) and content[:4] == b"%PDF": return True
+    return False
+
+
+def _collect_all_pdf_candidates(html_text, base_url, max_candidates=15):
+    if not html_text: return []
+    try: soup = BeautifulSoup(html_text, "html.parser")
+    except Exception: return []
+    def _valid(href):
+        if not href or not isinstance(href, str): return False
+        h = href.strip().lower()
+        if not h: return False
+        if h.startswith(("#", "javascript:", "mailto:", "tel:", "data:", "whatsapp:", "fb:", "blob:")): return False
+        return True
+    def _is_html_page(href):
+        h = href.lower()
+        for ext in (".html", ".htm", ".asp", ".aspx", ".jsp", ".php", ".cgi", ".shtml", ".css", ".js"):
+            if h.endswith(ext) or ext + "?" in h: return True
+        return False
+    def _abs(href): return canonical_url(urljoin(base_url, href))
+    candidates: Dict[str, int] = {}
+    def _add(href, priority):
+        if not _valid(href) or _is_html_page(href): return
+        abs_url = _abs(href)
+        if abs_url == canonical_url(base_url): return
+        if _is_navigation_url(abs_url): return
+        if candidates.get(abs_url, 0) < priority: candidates[abs_url] = priority
+    for tag in soup.find_all(["iframe", "embed", "object", "source"]):
+        src = tag.get("src") or tag.get("data") or ""
+        if src and not src.lower().startswith(("javascript:", "#", "data:")): _add(src, 100)
+    for tag in soup.find_all(onclick=True):
+        onclick = tag.get("onclick", "") or ""
+        for pat in (r"window\.open\(\s*['\"]([^'\"]+)['\"]", r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", r"window\.location\s*=\s*['\"]([^'\"]+)['\"]", r"window\.location\.href\s*=\s*['\"]([^'\"]+)['\"]"):
+            m = re.search(pat, onclick, re.I)
+            if m: _add(m.group(1), 95)
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        if ".pdf" in href.lower() or _looks_like_pdf_url(href): _add(href, 90)
+    _PDF_PATH_HINTS = ("/writereaddata/", "/uploadfile/", "/uploads/", "/upload/", "/downloadfile/", "/download_file/", "/getfile/", "/showfile/", "/viewfile/", "/filedownload/", "/files/", "/media/", "/attachment/", "/attachments/", "/docs/", "/documents/", "/file/", "/pdf/", "/download/", "/downloads/")
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        href_lower = href.lower()
+        if any(hint in href_lower for hint in _PDF_PATH_HINTS): _add(href, 80)
+    _TEXT_KEYWORDS = ("view", "download", "click here", "click", "open", "get", "see file", "show", "read", "attachment", "file", "link", "देखें", "डाउनलोड", "देखे", "खोलें", "फ़ाइल", "फाइल", "विवरण", "डाउनलोड करें", "देखें यहाँ", "यहाँ देखें", "खोलिये")
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        text = a.get_text(" ", strip=True).lower()
+        if not text: continue
+        if any(kw in text for kw in _TEXT_KEYWORDS):
+            priority = 70
+            if re.search(r"\d+\s*(kb|mb|bytes)", text, re.I): priority = 75
+            _add(href, priority)
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        img = a.find("img")
+        if not img: continue
+        img_attrs = " ".join([str(img.get("src") or ""), str(img.get("alt") or ""), " ".join(img.get("class") or []), str(img.get("title") or "")]).lower()
+        if any(kw in img_attrs for kw in ("pdf", "document", "file", "download", "attachment", "doc")): _add(href, 65)
+    _FILE_LABEL_RE = re.compile(r"^(file|फ़ाइल|फाइल|attachment|संलग्नक|file\s*name|फ़ाइल\s*नाम)\s*[:\-]?\s*$", re.I)
+    for label in soup.find_all(["td", "th", "label", "b", "strong", "span", "div", "dt"]):
+        label_text = label.get_text(" ", strip=True).strip()
+        if not _FILE_LABEL_RE.match(label_text): continue
+        parent = label.find_parent(["tr", "li", "div", "p", "dl"]) or label.parent
+        if not parent: continue
+        for a in parent.find_all("a", href=True): _add(a.get("href", ""), 60)
+    for a in soup.find_all("a", href=True, target="_blank"): _add(a.get("href", ""), 50)
+    for a in soup.find_all("a", href=True): _add(a.get("href", ""), 30)
+    ranked = sorted(candidates.items(), key=lambda x: -x[1])
+    return ranked[:max_candidates]
+
+
+def _find_pdf_link_in_html(html_text, base_url):
+    ranked = _collect_all_pdf_candidates(html_text, base_url, max_candidates=1)
+    return ranked[0][0] if ranked else None
+
+
+def _download_with_pdf_resolution(session, url, timeout, depth=0, _visited=None, verify_ssl=True):
+    """Resolve direct/HTML-wrapped PDFs without reading unbounded bodies into RAM."""
+    if _visited is None: _visited = set()
+    canon = canonical_url(url)
+    if canon in _visited: return None, url, "already_visited"
+    _visited.add(canon)
+    if depth > 3: return None, url, "max_depth_exceeded"
+    try:
+        head = session.head(url, timeout=min(10, timeout), allow_redirects=True, verify=verify_ssl)
+        cl = head.headers.get("content-length")
+        if cl:
+            try:
+                if int(cl) > MAX_PDF_SEND_BYTES: return None, url, "size_limit_head"
+            except (TypeError, ValueError): pass
+    except Exception: pass
+
+    try:
+        with session.get(url, timeout=timeout, allow_redirects=True, verify=verify_ssl, stream=True) as response:
+            if response.status_code >= 400: return None, url, f"http_{response.status_code}"
+            content_type = response.headers.get("content-type", "").lower()
+            final_url = response.url
+            likely_html = ("html" in content_type or "xhtml" in content_type or not content_type)
+            limit = MAX_HTML_DOWNLOAD_BYTES if likely_html else MAX_PDF_SEND_BYTES
+            chunks = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk: continue
+                total += len(chunk)
+                if total > limit:
+                    return None, url, "html_size_limit" if likely_html else "size_limit_stream"
+                chunks.append(chunk)
+            content = b"".join(chunks)
+    except requests.RequestException as exc:
+        return None, url, f"request_error:{type(exc).__name__}"
+    except Exception as exc:
+        return None, url, f"download_error:{type(exc).__name__}"
+
+    if _looks_like_pdf_response(content, content_type, final_url): return content, final_url, "direct_pdf"
+    if "html" in content_type or "xhtml" in content_type or not content_type:
+        try: html_text = content.decode("utf-8", errors="ignore")
+        except Exception: return None, url, "html_decode_error"
+        candidates = _collect_all_pdf_candidates(html_text, final_url, max_candidates=10)
+        if not candidates and _html_looks_like_js_pdf_viewer(html_text) and depth == 0:
+            print(f"[JS-PDF] Detected JS PDF viewer at {final_url[:80]}, rendering...", file=sys.stderr)
+            rendered_html, rendered_url, _ = _render_with_playwright(final_url, wait_after_ms=3000, scroll_bottom=False)
+            if rendered_html: candidates = _collect_all_pdf_candidates(rendered_html, rendered_url or final_url, max_candidates=10)
+        for cand_url, priority in candidates:
+            sub_content, sub_url, sub_method = _download_with_pdf_resolution(session, cand_url, timeout, depth + 1, _visited, verify_ssl)
+            if sub_content: return sub_content, sub_url, f"html_wrap(p{priority})->{sub_method}"
+        return None, url, "html_no_pdf_found"
+    if content[:4] == b"%PDF": return content, final_url, "magic_bytes"
+    return None, url, f"unsupported:{content_type[:40]}"
+
+
+_MONTH_NAMES = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3, "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7, "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9, "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+    "जनवरी": 1, "फरवरी": 2, "मार्च": 3, "अप्रैल": 4, "मई": 5, "जून": 6, "जुलाई": 7, "अगस्त": 8, "सितंबर": 9, "सितम्बर": 9, "अक्टूबर": 10, "अक्तूबर": 10, "नवंबर": 11, "नवम्बर": 11, "दिसंबर": 12, "दिसम्बर": 12,
+}
+_MONTH_REGEX = (r"jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december|जनवरी|फरवरी|मार्च|अप्रैल|मई|जून|जुलाई|अगस्त|सितंबर|सितम्बर|अक्टूबर|अक्तूबर|नवंबर|नवम्बर|दिसंबर|दिसम्बर")
+_FULL_DATE_PATTERNS = [
+    re.compile(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})\b"),
+    re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"),
+    re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?[\s\-]+(" + _MONTH_REGEX + r")[\s\-,]+(\d{4})\b", re.I),
+    re.compile(r"\b(" + _MONTH_REGEX + r")[\s\-]+(\d{1,2})(?:st|nd|rd|th)?[\s\-,]+(\d{4})\b", re.I),
+]
+
+
+def _extract_full_dates(text):
+    if not text: return []
+    dates = []
+    for pat in _FULL_DATE_PATTERNS:
+        for m in pat.finditer(text):
+            try:
+                g = m.groups()
+                if len(g) != 3: continue
+                a, b, c = g
+                if a.isdigit() and len(a) == 4: y, mo, d = int(a), int(b), int(c)
+                elif b.isalpha() or (b and not b.isdigit()): d = int(a); mo = _MONTH_NAMES.get(b.lower(), 0); y = int(c)
+                elif a and not a.isdigit(): mo = _MONTH_NAMES.get(a.lower(), 0); d = int(b); y = int(c)
+                else: d, mo, y = int(a), int(b), int(c)
+                if not (1 <= mo <= 12 and 1 <= d <= 31): continue
+                if not (1990 <= y <= 2100): continue
+                dates.append(datetime(y, mo, d, tzinfo=timezone.utc))
+            except (ValueError, IndexError, TypeError, AttributeError): continue
+    return dates
+
+
+_UPLOAD_DATE_TEXT_PATTERNS = [
+    re.compile(r"(?:published|posted|uploaded|issued|dated)\s*(?:on|at|:|\-)?\s*(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})", re.I),
+    re.compile(r"(?:published|posted|uploaded|issued|dated)\s*(?:on|at|:|\-)?\s*(\d{1,2}(?:st|nd|rd|th)?\s+(?:" + _MONTH_REGEX + r")\s+\d{4})", re.I),
+    re.compile(r"(?:दिनांक|प्रकाशित|जारी|अपलोड|अद्यतन)\s*[:\-]?\s*(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})", re.I),
+]
+
+
+def _extract_explicit_issue_dates(text):
+    if not text: return []
+    text = str(text).translate(_DEVA_DIGIT_TRANS)
+    dates = []
+    for pattern in _UPLOAD_DATE_TEXT_PATTERNS:
+        for match in pattern.finditer(text):
+            dates.extend(_extract_full_dates(match.group(1)))
+    if not dates:
+        dates.extend(_extract_full_dates(text))
+    return sorted(set(dates))
+
+
+def _extract_upload_date(anchor_tag):
+    try:
+        search_root = (anchor_tag.find_parent("tr") or anchor_tag.find_parent("li") or anchor_tag.find_parent("article") or anchor_tag.find_parent(["div", "section"]) or anchor_tag.parent)
+        if not search_root: return None
+        time_tag = search_root.find("time")
+        if time_tag:
+            raw = time_tag.get("datetime") or time_tag.get_text(strip=True)
+            if raw:
+                try:
+                    iso = raw.replace("Z", "+00:00").strip()
+                    dt = datetime.fromisoformat(iso)
+                    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                    return dt
+                except Exception: pass
+                ds = _extract_full_dates(raw)
+                if ds: return max(ds)
+        text = search_root.get_text(" ", strip=True)
+        for pat in _UPLOAD_DATE_TEXT_PATTERNS:
+            m = pat.search(text)
+            if m:
+                ds = _extract_full_dates(m.group(1))
+                if ds: return max(ds)
+        all_dates = _extract_full_dates(text)
+        if all_dates: return max(all_dates)
+    except Exception: pass
+    return None
+
+
+
+# Dates on a notice are not interchangeable: copyright years, footer dates,
+# calendars/events mentioned in the body, and academic sessions must not make an
+# old notice appear new. Prefer issue/publication labels, then dates in the
+# document's opening section; deliberately ignore common footer/noise lines.
+_DATE_NOISE_LINE = re.compile(
+    r"copyright|\u00a9|all rights reserved|website last updated|last updated|"
+    r"upcoming event|upcoming events|event calendar|events calendar|"
+    r"designed by|developed by|maintained by|page generated|printed on|"
+    r"visit us|follow us|contact us|\bwebmaster\b|\bfooter\b", re.I)
+_ISSUE_DATE_LABEL = re.compile(
+    r"\b(?:date|dated|date of issue|issued on|notice date|notification date|"
+    r"published on|publication date|effective from|order dated|letter dated)\b|"
+    r"(?:दिनांक|जारी दिनांक|प्रकाशित दिनांक|आदेश दिनांक)\s*[:：\-]?", re.I)
+
+
+def _extract_document_dates(text):
+    """Extract likely issue dates, never treating arbitrary maximum date as issue date.
+
+    Explicit issue labels have priority. Otherwise only the document's opening
+    section is considered and obvious footer/calendar noise is removed. Dates
+    on mixed-content lines are extracted only from the labelled prefix where
+    possible, so a copyright/event year cannot overwrite an older issue date.
+    """
+    if not text:
+        return []
+    raw = str(text).translate(_DEVA_DIGIT_TRANS)
+    raw_lines = [re.sub(r"\s+", " ", line).strip() for line in raw.splitlines()]
+    raw_lines = [line for line in raw_lines if line]
+    labelled = []
+    for line in raw_lines[:100]:
+        # Ignore a line that is itself footer/calendar noise. If issue date and
+        # noise share a line, take only the portion before the noise marker.
+        noise_match = _DATE_NOISE_LINE.search(line)
+        issue_part = line[:noise_match.start()] if noise_match else line
+        if issue_part and _ISSUE_DATE_LABEL.search(issue_part):
+            labelled.extend(_extract_full_dates(issue_part))
+    if labelled:
+        return sorted(set(labelled))
+    opening_lines = []
+    for line in raw_lines:
+        if _DATE_NOISE_LINE.search(line):
+            continue
+        opening_lines.append(line)
+        if len(opening_lines) >= 35:
+            break
+    opening = "\n".join(opening_lines)[:3500]
+    return sorted(set(_extract_full_dates(opening)))
+
+
+_YEAR_ONLY_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+
+
+def _is_expired_by_date_or_year(text, now=None, grace_days=0):
+    """Exact full-date FIRST. Year-only fallback ONLY when no full date exists.
+    Returns (expired: bool, kind: 'exact'|'year'|'none', evidence)."""
+    now = now or datetime.now(timezone.utc)
+    cutoff_date = (now - timedelta(days=grace_days)).date()
+    raw = str(text or "").translate(_DEVA_DIGIT_TRANS)
+    lines = [ln for ln in raw.splitlines() if ln.strip() and not _DATE_NOISE_LINE.search(ln)]
+    source = "\n".join(lines)
+
+    exact_dates = _extract_document_dates(source)
+    if exact_dates:
+        newest = max(exact_dates)
+        return (newest.date() < cutoff_date, "exact", newest.date().isoformat())
+
+    years = [int(y) for y in _YEAR_ONLY_RE.findall(source)]
+    if years:
+        newest_year = max(years)
+        try:
+            latest_possible = datetime(newest_year, 12, 31, tzinfo=timezone.utc)
+        except ValueError:
+            return (False, "none", None)
+        return (latest_possible.date() < cutoff_date, "year", newest_year)
+
+    return (False, "none", None)
+
+def _has_current_actionable_reference(text, now=None):
+    """True only for a current/future year tied to an actionable notice topic.
+
+    This prevents a potentially genuine older circular announcing a 2026 exam,
+    event, deadline, admission, or registration from being silently discarded.
+    It does NOT itself mark the notice important; classification still must.
+    Copyright, website footer, and generic event-calendar lines are excluded.
+    """
+    if not text:
+        return False
+    now = now or datetime.now(timezone.utc)
+    current_year = now.year
+    action = re.compile(
+        r"\b(upcoming|event|exam|examination|admission|application|registration|"
+        r"counselling|counseling|deadline|last date|schedule|programme|program|"
+        r"convocation|interview|entrance|commencement|held on|to be held|"
+        r"प्रवेश|परीक्षा|कार्यक्रम|आयोजन|अंतिम तिथि|पंजीकरण|दीक्षांत|साक्षात्कार)\b",
+        re.I,
+    )
+    for raw_line in str(text).translate(_DEVA_DIGIT_TRANS).splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line or re.search(r"copyright|©|all rights reserved|website last updated|designed by|developed by|footer|event calendar|upcoming events?", line, re.I):
+            continue
+        if not action.search(line):
+            continue
+        years = [int(y) for y in re.findall(r"(?<!\d)(20\d{2})(?!\d)", line)]
+        if any(current_year <= year <= current_year + 3 for year in years):
+            return True
+        # A full future date is useful even if OCR did not retain the year label.
+        for dt in _extract_full_dates(line):
+            if now.date() <= dt.date() <= (now + timedelta(days=365 * 3)).date():
+                return True
+    return False
+
+def _is_stale_notice(title, context, url, upload_date=None, pdf_text=None, strict_pdf_date=False):
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=STALE_NOTICE_DAYS)
+
+    title_text = str(title or "")
+    context_text = str(context or "")
+    url_text = str(url or "")
+    pdf_text_str = str(pdf_text or "")
+    full_text = f"{title_text} {context_text} {url_text} {pdf_text_str}".strip()
+    normalized_title = title_text.translate(_DEVA_DIGIT_TRANS)
+    normalized_context = context_text.translate(_DEVA_DIGIT_TRANS)
+    normalized_full = full_text.translate(_DEVA_DIGIT_TRANS)
+    normalized_pdf_head = pdf_text_str[:500].translate(_DEVA_DIGIT_TRANS)
+    normalized_pdf_full = pdf_text_str.translate(_DEVA_DIGIT_TRANS)
+
+    # Do not suppress a meaningful amendment/corrigendum solely because the original notice is old.
+    title_context = f"{normalized_title} {normalized_context}".casefold()
+    amendment_signal = bool(re.search(r"corrigendum|revised|revision|amended|amendment|extension|extended|last date|deadline|date extended|शुद्धिपत्र|संशोधित|संशोधन|तिथि बढ़ाई|अंतिम तिथि बढ़ी|अवधि बढ़ाई", title_context, re.I))
+    notice_signal = any(_match_signal(title_context, sig) for sig in _NOTICE_SIGNALS)
+    # A title-level amendment signal must never bypass an available PDF/image OCR audit.
+    # Only use this fast-path before strict document text has been extracted.
+    if amendment_signal and notice_signal and not strict_pdf_date:
+        return False
+    active_signal = bool(re.search(r"admission|application|recruitment|vacancy|counselling|counseling|registration|scholarship|प्रवेश|आवेदन|भर्ती|रिक्ति|काउंसलिंग|पंजीकरण|छात्रवृत्ति", title_context, re.I))
+    # A future date in the HTML/title cannot override an older date inside the PDF.
+    if active_signal and not strict_pdf_date:
+        future_dates = [d for d in _extract_full_dates(normalized_full) if d.date() >= now.date()]
+        if future_dates:
+            return False
+
+    # STRICT PDF DATE: After PDF download, PDF content overrides HTML upload date.
+    # Applies to all universities. Fixes CUJ case where HTML says "uploaded today"
+    # but PDF content is from old batch/session (e.g., 2022-23).
+    if strict_pdf_date and normalized_pdf_full.strip():
+        # Never use max(all PDF dates): it can select © 2026 or an upcoming
+        # event from a footer and incorrectly refresh a 2023 notice.
+        pdf_dates = _extract_document_dates(normalized_pdf_full)
+        pdf_session_pattern = re.compile(r"(?<!\d)((?:19|20)\d{2})\s*[-/–—]\s*((?:19|20)\d{2}|\d{2})(?!\d)")
+        # Session ranges count only when found in the title or opening section,
+        # not in footers, event calendars, or arbitrary body references.
+        session_source = "\n".join(normalized_pdf_full.splitlines()[:35])[:3500]
+        pdf_session_ends = []
+        for m in pdf_session_pattern.finditer(session_source):
+            start_yr = int(m.group(1))
+            end_token = m.group(2)
+            end_yr = int(end_token) if len(end_token) == 4 else (start_yr // 100) * 100 + int(end_token)
+            if end_yr < start_yr: end_yr += 100
+            pdf_session_ends.append(end_yr)
+
+        newest_pdf_date = max(pdf_dates) if pdf_dates else None
+        newest_pdf_session_end = max(pdf_session_ends) if pdf_session_ends else None
+        actionable_future = _has_current_actionable_reference(normalized_pdf_full, now)
+        revision_signal = bool(re.search(
+            r"corrigendum|revised|revision|amended|amendment|addendum|extension|extended|"
+            r"date extended|last date|शुद्धिपत्र|संशोधित|संशोधन|तिथि बढ़ाई|अवधि बढ़ाई",
+            f"{normalized_title}\n{session_source}", re.I
+        ))
+        # Revision bypass MUST be backed by an EXACT full date (year alone is NOT enough)
+        revision_exact_dates = _extract_document_dates(f"{normalized_title}\n{session_source}")
+        revision_has_current_exact = bool(
+            revision_signal and revision_exact_dates
+            and any(d.date() >= cutoff.date() for d in revision_exact_dates)
+        )
+
+        if newest_pdf_date and newest_pdf_date < cutoff and (
+            actionable_future or revision_has_current_exact
+        ):
+            reason = (
+                "current/future actionable reference"
+                if actionable_future
+                else "exact revision date confirms current"
+            )
+            print(f"[DATE-REVIEW] Old issue date plus {reason}; retain for content verification", file=sys.stderr)
+            return False
+
+        if newest_pdf_date or newest_pdf_session_end:
+            session_end_dt = None
+            if newest_pdf_session_end:
+                try:
+                    session_end_dt = datetime(newest_pdf_session_end, 12, 31, tzinfo=timezone.utc)
+                except (ValueError, OverflowError):
+                    session_end_dt = None
+
+            is_recent = False
+            if newest_pdf_date and newest_pdf_date >= cutoff:
+                is_recent = True
+            if session_end_dt and session_end_dt >= cutoff:
+                is_recent = True
+
+            if not is_recent:
+                date_str = str(newest_pdf_date.date()) if newest_pdf_date else "N/A"
+                print(f"[STALE-PDF-STRICT] PDF content old (date={date_str}, session_end={newest_pdf_session_end})", file=sys.stderr)
+                return True
+            return False
+
+    title_words = normalized_title.split()
+    if len(title_words) >= 5:
+        first_words = " ".join(title_words[:6]).lower()
+        early_nav_count = sum(1 for sig in _STRICT_EARLY_NAV_SIGNALS if _match_signal(first_words, sig))
+        if early_nav_count >= 2:
+            if not _is_notice_document_url(url): return True
+        short_words = [w for w in title_words if len(w.strip("|•-–—,:;")) <= 6]
+        title_lower = normalized_title.lower()
+        nav_count = _count_nav_signals(title_lower)
+        has_notice_signal = any(_match_signal(title_lower, sig) for sig in _NOTICE_SIGNALS)
+        mostly_short = len(short_words) >= len(title_words) * 0.6
+        explicit_nav_dump = any(_match_signal(title_lower, sig) for sig in _EXPLICIT_DUMP_SIGNALS)
+        compact_social_dump = (len(title_words) <= 8 and nav_count >= 3 and not has_notice_signal)
+        if not has_notice_signal and not _is_notice_document_url(url):
+            if (mostly_short and (nav_count >= 2 or explicit_nav_dump)) or compact_social_dump: return True
+
+    title_dates = _extract_document_dates(normalized_title)
+    # For documents already checked, only use credible document dates; never
+    # let arbitrary future dates elsewhere in body text refresh an old notice.
+    if strict_pdf_date and normalized_pdf_full.strip():
+        head_dates = _extract_document_dates(normalized_pdf_full)
+        body_dates = []
+    else:
+        head_dates = _extract_document_dates(normalized_pdf_head) if normalized_pdf_head else []
+        body_dates = _extract_document_dates(normalized_context)
+    all_dates = list(set(title_dates + head_dates + body_dates))
+
+    # When a PDF/image has been OCR-checked, its own content is authoritative.
+    # Do not use a fresh HTML upload timestamp to make an undated/old document look new.
+    # If OCR found no date, the item remains eligible for the normal content classifier;
+    # absence of a date alone is not treated as proof that it is stale or genuine.
+    document_text_was_checked = bool(strict_pdf_date and normalized_pdf_full.strip())
+    if upload_date is not None and not document_text_was_checked:
+        try:
+            if upload_date.tzinfo is None: upload_date = upload_date.replace(tzinfo=timezone.utc)
+            else: upload_date = upload_date.astimezone(timezone.utc)
+            all_dates.append(upload_date)
+        except (AttributeError, ValueError): pass
+
+    if all_dates:
+        max_date = max(all_dates)
+        if max_date >= cutoff:
+            return False
+        print(f"[STALE] All {len(all_dates)} date(s) older than {STALE_NOTICE_DAYS} days; newest={max_date.date()}", file=sys.stderr)
+        return True
+
+    current_year = now.year
+    current_academic_start = current_year if now.month >= 7 else current_year - 1
+    current_year_update = bool(re.search(
+        rf"(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र).{{0,50}}{current_year}|{current_year}.{{0,50}}(?:revised|revision|corrigendum|addendum|amended|modified|संशोधित|शुद्धिपत्र)",
+        f"{normalized_title} {normalized_context}", re.I))
+    session_pattern = re.compile(r"(?<!\d)((?:19|20)\d{2})\s*[-/–—]\s*((?:19|20)\d{2}|\d{2})(?!\d)")
+    admission_session_signal = bool(re.search(
+        r"\b(?:admission|admissions|provisional|application|counselling|counseling|selection\s+list|merit\s+list|ph\.?d\.?|enrollment|enrolment|प्रवेश|आवेदन|चयन\s+सूची|मेरिट\s+सूची)\b",
+        normalized_title, re.I))
+    if admission_session_signal and not current_year_update:
+        for match in session_pattern.finditer(normalized_title):
+            session_start = int(match.group(1))
+            end_token = match.group(2)
+            session_end = int(end_token) if len(end_token) == 4 else (session_start // 100) * 100 + int(end_token)
+            if session_end < session_start: session_end += 100
+            if session_start < current_academic_start:
+                print(f"[STALE-SESSION] Old session {session_start}-{session_end}", file=sys.stderr)
+                return True
+
+    batch_session_signal = bool(re.search(
+        r'\b(?:batch|session)\s*[:\-]?\s*\d{2,4}|\b20\d{2}\s*[-/–—]\s*(?:20)?\d{2,4}\b',
+        normalized_title, re.I
+    ))
+    # A batch/session year is not the publication date. If the PDF was read
+    # but no credible issue date was found, retain it for content classification
+    # and log the uncertainty. Do not let the HTML upload date prove PDF freshness.
+    if strict_pdf_date and normalized_pdf_full.strip() and not _extract_document_dates(normalized_pdf_full):
+        batch_years = [
+            int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", normalized_title)
+        ]
+        old_batch_years = [y for y in batch_years if y < now.year - OLD_YEAR_HINT_YEARS_BACK]
+        if batch_session_signal and old_batch_years:
+            print(
+                f"[DATE-REVIEW] PDF has no credible issue date; old batch/session year(s) "
+                f"{sorted(set(old_batch_years))}; retain for content classification, not auto-send",
+                file=sys.stderr
+            )
+
+    if not batch_session_signal:
+        year_evidence = f"{normalized_title} {normalized_context} {normalized_pdf_full}".strip()
+        years = [int(year) for year in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", year_evidence)]
+        if years:
+            max_year = max(years)
+            try:
+                latest_possible = datetime(max_year, 12, 31, tzinfo=timezone.utc)
+                if latest_possible < cutoff:
+                    print(f"[STALE-YEAR] Latest possible for {max_year} ({latest_possible.date()}) is older than {STALE_NOTICE_DAYS} days", file=sys.stderr)
+                    return True
+            except (ValueError, OverflowError): pass
+
+    return False
+
+
+def _needs_undated_old_batch_review(title, pdf_text, now=None):
+    """
+    Return True when a readable PDF has an old batch/session year but no
+    credible document date. Such items are held for review/retry, not sent
+    automatically and not permanently marked stale.
+    """
+    now = now or datetime.now(timezone.utc)
+    title_text = str(title or "").translate(_DEVA_DIGIT_TRANS)
+    pdf = str(pdf_text or "").translate(_DEVA_DIGIT_TRANS)
+    if not pdf.strip():
+        return False
+
+    # Credible dates extracted from the document mean normal date rules apply.
+    try:
+        if _extract_document_dates(pdf):
+            return False
+    except Exception:
+        pass
+
+    combined_head = f"{title_text}\n" + "\n".join(pdf.splitlines()[:35])[:3500]
+    years = [int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", title_text)]
+    pdf_years = [int(y) for y in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", "\n".join(pdf.splitlines()[:35]))]
+    years.extend(pdf_years)
+    old_batch_years = [y for y in years if y < now.year - OLD_YEAR_HINT_YEARS_BACK]
+    batch_signal = bool(re.search(
+        r"\b(?:batch|session|semester|backlog|old\s+batch|प्रवेश\s+सत्र|बैच|सत्र)\b",
+        title_text, re.I
+    ))
+    if not (batch_signal and old_batch_years):
+        return False
+
+    # Exception only for a clearly signalled revision carrying the current year,
+    # or an explicitly actionable future deadline/event in the PDF text.
+    revision_signal = bool(re.search(
+        r"corrigendum|revised|revision|amended|amendment|addendum|extension|extended|"
+        r"date extended|last date|शुद्धिपत्र|संशोधित|संशोधन|तिथि बढ़ाई|अवधि बढ़ाई",
+        combined_head, re.I
+    ))
+    current_year = now.year
+    revision_current_year = bool(
+        revision_signal and re.search(rf"(?<!\d){current_year}(?!\d)", combined_head)
+    )
+    try:
+        actionable_future = _has_current_actionable_reference(pdf, now)
+    except Exception:
+        actionable_future = False
+
+    return not (revision_current_year or actionable_future)
+
+
+def _classify_stale_reason(title, context, url, upload_date=None, pdf_text=None):
+    if not _is_stale_notice(title, context, url, upload_date=upload_date, pdf_text=pdf_text): return None
+    title_lower = str(title or "").lower()
+    nav_count = _count_nav_signals(title_lower)
+    has_notice_signal = any(_match_signal(title_lower, sig) for sig in _NOTICE_SIGNALS)
+    if nav_count >= 2 and not has_notice_signal: return f"MENU-DUMP(nav={nav_count})"
+    return "STALE"
+
+
+def utc_now(): return datetime.now(timezone.utc).isoformat()
+
+
+def clean_text(value, limit=500):
+    value = re.sub(r"\s+", " ", value or "").strip()
+    return value[:limit]
+
+
+def load_json(path, default):
+    try:
+        with path.open("r", encoding="utf-8") as f: return json.load(f)
+    except FileNotFoundError: return default
+    except json.JSONDecodeError as exc: raise RuntimeError(f"Invalid JSON in {path.name}: {exc}") from exc
+
+
+def atomic_save_json(path, data, max_bytes=None):
+    tmp = path.with_suffix(path.suffix + ".new")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if max_bytes is not None:
+            size = tmp.stat().st_size
+            if size > max_bytes: raise RuntimeError(f"Serialized state exceeds byte cap: {size} > {max_bytes}")
+        os.replace(tmp, path)
+    except Exception:
+        try: tmp.unlink(missing_ok=True)
+        except OSError: pass
+        raise
+
+
+def canonical_url(raw):
+    raw = (raw or "").strip()
+    p = urlparse(raw)
+    if not p.scheme or not p.netloc: return raw
+    return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path or "/", "", p.query, ""))
+
+
+def _canonical_spa_url(raw):
+    raw = (raw or "").strip()
+    p = urlparse(raw)
+    if not p.scheme or not p.netloc: return raw
+    fragment = (p.fragment or "").strip()
+    keep_fragment = fragment.startswith("/") or fragment.startswith("!/")
+    return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path or "/", "", p.query, fragment if keep_fragment else ""))
+
+
+def canonical_identity_url(raw):
+    normalized = _canonical_spa_url(raw)
+    p = urlparse(normalized)
+    if not p.scheme or not p.netloc: return normalized
+    tracking_exact = {"fbclid", "gclid", "dclid", "msclkid", "yclid", "mc_cid", "mc_eid", "ref", "referrer", "lang", "language", "_ga", "_gl", "igshid"}
+    pairs = []
+    for key, value in parse_qsl(p.query, keep_blank_values=True):
+        key_lower = key.casefold()
+        if key_lower in tracking_exact or key_lower.startswith("utm_"): continue
+        pairs.append((key, value))
+    pairs.sort(key=lambda pair: (pair[0].casefold(), pair[1]))
+    return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path or "/", "", urlencode(pairs, doseq=True), p.fragment))
+
+
+def _normalize_host(host):
+    h = (host or "").lower().strip()
+    if h.startswith("www."): h = h[4:]
+    return h
+
+
+def same_host(a, b): return _normalize_host(urlparse(a).netloc) == _normalize_host(urlparse(b).netloc)
+def is_http_url(url): return urlparse(url).scheme in {"http", "https"}
+def is_pdf(url): return urlparse(url).path.lower().endswith(".pdf")
+
+
+def make_session():
+    session = requests.Session()
+    retry = Retry(total=2, connect=2, read=2, status=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=frozenset({"GET", "HEAD"}), respect_retry_after_header=True, raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-IN,en;q=0.8,hi;q=0.7", "Cache-Control": "no-cache"})
+    return session
+
+
+def _site_health_check(session, site, timeout=15):
+    """
+    Pre-scan health check. Returns (state, detail).
+    State: OK | DNS_FAIL | DOWN | TIMEOUT | SSL_ERROR | WAF_BLOCK | HTTP_4XX | HTTP_5XX
+    """
+    base = site["url"]
+    host = urlparse(base).hostname
+    if not host:
+        return "DOWN", f"Invalid URL: {base}"
+
+    # 1) DNS
+    try:
+        socket.getaddrinfo(host, 443)
+    except socket.gaierror as e:
+        return "DNS_FAIL", f"DNS resolution failed for {host}: {e}"
+    except Exception as e:
+        return "DNS_FAIL", f"DNS check error: {type(e).__name__}: {e}"
+
+    # 2) HTTP
+    try:
+        r = session.get(
+            base, timeout=timeout, allow_redirects=True,
+            verify=site.get("verify_ssl", True), stream=True,
+        )
+        status = r.status_code
+        server_hdr = (r.headers.get("Server") or "")[:60]
+        r.close()
+    except requests.exceptions.SSLError as e:
+        return "SSL_ERROR", f"SSL error: {str(e)[:160]}"
+    except requests.exceptions.Timeout:
+        return "TIMEOUT", f"HTTP timeout after {timeout}s"
+    except requests.exceptions.ConnectionError as e:
+        return "DOWN", f"Connection error: {str(e)[:160]}"
+    except Exception as e:
+        return "DOWN", f"{type(e).__name__}: {str(e)[:160]}"
+
+    if status == 403:
+        return "WAF_BLOCK", f"403 Forbidden (firewall/WAF) [server={server_hdr}]"
+    if status == 429:
+        return "WAF_BLOCK", f"429 Too Many Requests (rate limited) [server={server_hdr}]"
+    if 500 <= status < 600:
+        return "HTTP_5XX", f"HTTP {status} server error [server={server_hdr}]"
+    if 400 <= status < 500:
+        return "HTTP_4XX", f"HTTP {status} client error [server={server_hdr}]"
+    return "OK", f"HTTP {status} [server={server_hdr}]"
+
+
+_SITE_VERIFY_SSL_BY_ID = {}
+_SITE_TIMEOUT_BY_ID = {}
+
+
+def get_config():
+    cfg = load_json(CONFIG_FILE, {})
+    if not isinstance(cfg, dict): raise RuntimeError("websites.json root must be an object")
+    scan = cfg.get("scan") or {}
+    defaults = {
+        "request_timeout_seconds": 45, "max_workers": 5, "max_items_per_site": 75, "max_discovery_pages_per_site": 10, "max_archive_pages_per_site": 20, "max_pagination_per_archive": 4, "max_new_items_per_run": 25, "gemini_batch_size": 3, "gemini_max_calls_per_run": 15, "retention_days": 90, "sent_retention_days": 180, "ignored_retention_days": 30, "baseline_retention_days": 90, "domain_delay_seconds": 0.4, "max_state_items": 3000, "max_state_bytes": 8000000, "max_pending_attempts": 500, "stale_notice_days": 15, "baseline_max_errors": 3, "exclude_title_signals": list(_DEFAULT_EXCLUDED_TITLE_SIGNALS), "site_alert_threshold": 3, "site_alert_cooldown_hours": 6, "keywords": [], "discovery_keywords": [], "sitemap_enabled": True,
+    }
+    for key, value in defaults.items(): scan.setdefault(key, value)
+    scan["request_timeout_seconds"] = max(5, int(scan["request_timeout_seconds"]))
+    scan["max_workers"] = max(1, int(scan["max_workers"]))
+    scan["max_items_per_site"] = max(1, int(scan["max_items_per_site"]))
+    scan["max_discovery_pages_per_site"] = max(1, int(scan["max_discovery_pages_per_site"]))
+    scan["max_archive_pages_per_site"] = max(0, int(scan["max_archive_pages_per_site"]))
+    scan["max_pagination_per_archive"] = max(0, int(scan["max_pagination_per_archive"]))
+    scan["max_new_items_per_run"] = max(1, int(scan["max_new_items_per_run"]))
+    scan["gemini_batch_size"] = max(1, min(20, int(scan["gemini_batch_size"])))
+    scan["gemini_max_calls_per_run"] = max(1, int(scan["gemini_max_calls_per_run"]))
+    scan["retention_days"] = max(7, int(scan["retention_days"]))
+    scan["sent_retention_days"] = max(7, int(scan["sent_retention_days"]))
+    scan["ignored_retention_days"] = max(7, int(scan["ignored_retention_days"]))
+    scan["baseline_retention_days"] = max(7, int(scan["baseline_retention_days"]))
+    scan["domain_delay_seconds"] = max(0.0, min(10.0, float(scan["domain_delay_seconds"])))
+    scan["max_state_items"] = max(500, min(10000, int(scan["max_state_items"])))
+    scan["max_sent_fingerprints"] = max(1000, min(50000, int(scan.get("max_sent_fingerprints", 12000))))
+    scan["max_html_fingerprints"] = max(1000, min(30000, int(scan.get("max_html_fingerprints", 8000))))
+    scan["max_state_bytes"] = max(500000, min(10000000, int(scan["max_state_bytes"])))
+    scan["max_pending_attempts"] = max(500, int(scan["max_pending_attempts"]))
+    scan["stale_notice_days"] = max(1, int(scan["stale_notice_days"]))
+    scan["baseline_max_errors"] = max(0, min(50, int(scan.get("baseline_max_errors", 3))))
+    raw_exclusions = scan.get("exclude_title_signals", list(_DEFAULT_EXCLUDED_TITLE_SIGNALS))
+    if not isinstance(raw_exclusions, list): raw_exclusions = list(_DEFAULT_EXCLUDED_TITLE_SIGNALS)
+    scan["exclude_title_signals"] = list(dict.fromkeys(clean_text(str(x), 100).casefold() for x in raw_exclusions if str(x).strip()))
+    scan["site_alert_threshold"] = max(1, int(scan["site_alert_threshold"]))
+    scan["site_alert_cooldown_hours"] = max(1, int(scan["site_alert_cooldown_hours"]))
+    scan["sitemap_enabled"] = bool(scan["sitemap_enabled"])
+    scan["keywords"] = [clean_text(str(x), 80).lower() for x in scan.get("keywords", []) if str(x).strip()]
+    scan["discovery_keywords"] = [clean_text(str(x), 80).lower() for x in scan.get("discovery_keywords", []) if str(x).strip()]
+    cfg["scan"] = scan
+    sites = cfg.get("websites")
+    if not isinstance(sites, list): raise RuntimeError("websites.json must contain a 'websites' array")
+    enabled = []
+    ids = set()
+    for raw_site in sites:
+        if not isinstance(raw_site, dict) or not raw_site.get("enabled", True): continue
+        site = dict(raw_site)
+        site["name"] = clean_text(str(site.get("name", "Unnamed Site")), 120)
+        site["url"] = _canonical_spa_url(str(site.get("url", "")))
+        site["id"] = clean_text(str(site.get("id", site["name"])), 100)
+        if not site["name"] or not is_http_url(site["url"]):
+            print(f"[WARN] Skipping invalid site: {raw_site}")
+            continue
+        if site["id"] in ids:
+            print(f"[WARN] Duplicate site id skipped: {site['id']}")
+            continue
+        ids.add(site["id"])
+        site["keywords"] = [clean_text(str(x), 80).lower() for x in site.get("keywords", []) if str(x).strip()]
+        site["discovery_keywords"] = [clean_text(str(x), 80).lower() for x in site.get("discovery_keywords", []) if str(x).strip()]
+        js_mode = str(site.get("js_render", "auto")).strip().lower()
+        if js_mode not in ("auto", "always", "never"): js_mode = "auto"
+        site["js_render"] = js_mode
+        raw_stealth = site.get("use_stealth_on_block", False)
+        if isinstance(raw_stealth, str):
+            site["use_stealth_on_block"] = raw_stealth.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            site["use_stealth_on_block"] = bool(raw_stealth)
+        try: site["request_timeout_seconds"] = max(5, min(180, int(site.get("request_timeout_seconds", scan["request_timeout_seconds"]))))
+        except (TypeError, ValueError, OverflowError): site["request_timeout_seconds"] = scan["request_timeout_seconds"]
+        try: site["baseline_max_errors"] = max(0, min(50, int(site.get("baseline_max_errors", scan["baseline_max_errors"]))))
+        except (TypeError, ValueError, OverflowError): site["baseline_max_errors"] = scan["baseline_max_errors"]
+        raw_verify_ssl = site.get("verify_ssl", True)
+        if isinstance(raw_verify_ssl, str): requested_verify_ssl = raw_verify_ssl.strip().casefold() not in {"0", "false", "no", "off"}
+        else: requested_verify_ssl = bool(raw_verify_ssl)
+        site["verify_ssl"] = bool(requested_verify_ssl or not ALLOW_INSECURE_TLS)
+        if not site["verify_ssl"]:
+            print(f"[SECURITY-WARN] TLS verification disabled by explicit opt-in for {site['id']}; avoid this unless absolutely necessary", file=sys.stderr)
+        elif not requested_verify_ssl:
+            print(f"[SECURITY] Ignoring verify_ssl=false for {site['id']}; TLS verification remains enabled. Set ALLOW_INSECURE_TLS=true only for a temporary, trusted workaround.", file=sys.stderr)
+        try: site["js_wait_after_ms"] = max(0, min(60000, int(site.get("js_wait_after_ms", JS_WAIT_AFTER_MS))))
+        except (TypeError, ValueError, OverflowError): site["js_wait_after_ms"] = JS_WAIT_AFTER_MS
+        raw_scroll = site.get("js_scroll_bottom", JS_SCROLL_TO_BOTTOM)
+        if isinstance(raw_scroll, str): site["js_scroll_bottom"] = raw_scroll.strip().lower() in {"1", "true", "yes", "on"}
+        else: site["js_scroll_bottom"] = bool(raw_scroll)
+        raw_selector = site.get("js_wait_for_selector", JS_WAIT_FOR_SELECTOR_DEFAULT)
+        site["js_wait_for_selector"] = clean_text(str(raw_selector or ""), 200) or None
+        try: site["js_selector_timeout_ms"] = max(1000, min(90000, int(site.get("js_selector_timeout_ms", 10000))))
+        except (TypeError, ValueError, OverflowError): site["js_selector_timeout_ms"] = 10000
+        try: site["max_items_per_site"] = max(1, min(500, int(site.get("max_items_per_site", scan["max_items_per_site"]))))
+        except (TypeError, ValueError, OverflowError): site["max_items_per_site"] = scan["max_items_per_site"]
+        raw_direct = site.get("direct_urls", [])
+        if not isinstance(raw_direct, list): raw_direct = []
+        site["direct_urls"] = [str(u).strip() for u in raw_direct if isinstance(u, (str, bytes)) and str(u).strip()]
+        enabled.append(site)
+    cfg["websites"] = enabled
+    global _SITE_VERIFY_SSL_BY_ID, _SITE_TIMEOUT_BY_ID
+    _SITE_VERIFY_SSL_BY_ID = {site["id"]: site["verify_ssl"] for site in enabled}
+    _SITE_TIMEOUT_BY_ID = {site["id"]: site["request_timeout_seconds"] for site in enabled}
+    return cfg
+
+
+def default_state():
+    return {"version": 33, "initialized": False, "last_run": None, "items": {}, "sent_fingerprints": {}, "html_fingerprints": {}, "sites": {}, "review_queue": {}, "metrics": {"site_scan_success": {}, "site_scan_failure": {}, "parse_errors": 0, "sent_notifications": 0, "failed_notifications": 0, "duplicate_rejects": 0, "state_save_failures": 0, "js_renders": 0}, "stats": {"runs": 0, "sent": 0, "ignored": 0, "pending": 0, "errors": 0}}
+
+
+def load_state():
+    state = load_json(STATE_FILE, default_state())
+    if not isinstance(state, dict): state = default_state()
+    state.setdefault("version", 1)
+    state.setdefault("initialized", False)
+    state.setdefault("last_run", None)
+    state.setdefault("items", {})
+    state.setdefault("sent_fingerprints", {})
+    state.setdefault("html_fingerprints", {})
+    state.setdefault("sites", {})
+    state.setdefault("review_queue", {})
+    state.setdefault("metrics", {})
+    state["metrics"].setdefault("site_scan_success", {})
+    state["metrics"].setdefault("site_scan_failure", {})
+    state["metrics"].setdefault("js_renders", 0)
+    for _metric in ("parse_errors", "sent_notifications", "failed_notifications", "duplicate_rejects", "state_save_failures"): state["metrics"].setdefault(_metric, 0)
+    state.setdefault("stats", {})
+    for key in ("runs", "sent", "ignored", "pending", "errors"): state["stats"].setdefault(key, 0)
+    for record in state["items"].values():
+        if not isinstance(record, dict): continue
+        if "status" not in record:
+            if record.get("sent") is True: record["status"] = "sent"
+            elif record.get("ignored") is True: record["status"] = "ignored"
+            else: record["status"] = "baseline"
+        record["_loaded_status"] = record.get("status")
+        record.setdefault("attempts", 0); record.setdefault("last_error", None); record.setdefault("summary", ""); record.setdefault("classification", None); record.setdefault("pdf_extracted", False); record.setdefault("pdf_text", ""); record.setdefault("pdf_attempts", 0); record.setdefault("ocr_used", False); record.setdefault("pdf_method", ""); record.setdefault("telegram_attempts", 0); record.setdefault("pdf_sent", False); record.setdefault("upload_date", None); record.setdefault("explicit_title", ""); record.setdefault("first_seen", utc_now()); record.setdefault("last_seen", record["first_seen"]); record.setdefault("etag", None); record.setdefault("last_modified", None); record.setdefault("pdf_hash", None); record.setdefault("pdf_hash_kind", None); record.setdefault("last_content_check_at", None)
+        if not record.get("last_content_check_at"): record["last_content_check_at"] = (record.get("last_seen") or record.get("first_seen") or utc_now())
+    # Migration-safe: rebuild both compact indexes from retained sent records.
+    # Existing indexes are preserved, so previously pruned records remain deduplicated.
+    for iid, record in state["items"].items():
+        if isinstance(record, dict) and record.get("status") == "sent":
+            _remember_sent_fingerprint(state, record, iid)
+    state["version"] = 33
+    return state
+
+
+def site_state(state, site_id):
+    s = state.setdefault("sites", {}).setdefault(site_id, {})
+    s.setdefault("baseline_complete", False); s.setdefault("consecutive_failures", 0); s.setdefault("total_failures", 0); s.setdefault("last_success", None); s.setdefault("last_error", None); s.setdefault("last_error_at", None); s.setdefault("last_item_count", 0); s.setdefault("alert_active", False); s.setdefault("last_alert_at", None); s.setdefault("last_recovery_at", None)
+    return s
+
+
+def mark_site_success(state, site_id, count):
+    s = site_state(state, site_id)
+    s["consecutive_failures"] = 0
+    s["last_success"] = utc_now()
+    s["last_error"] = None
+    s["last_error_at"] = None
+    s["last_item_count"] = count
+    s.pop("quarantined_until", None)
+    s.pop("quarantine_reason", None)
+
+
+def mark_site_failure(state, site_id, error):
+    s = site_state(state, site_id)
+    s["consecutive_failures"] += 1
+    s["total_failures"] += 1
+    s["last_error"] = clean_text(error, 500)
+    s["last_error_at"] = utc_now()
+    # Circuit breaker: 30 consecutive failures -> 24h quarantine
+    if s["consecutive_failures"] >= 30:
+        s["quarantined_until"] = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        s["quarantine_reason"] = clean_text(error, 200)
+        print(
+            f"[CIRCUIT-BREAKER] site_id={site_id} quarantined 24h "
+            f"(consecutive_failures={s['consecutive_failures']})",
+            file=sys.stderr,
+        )
+
+
+def _check_and_send_site_alerts(state, cfg, token, chat_id, threshold=3, cooldown_hours=6):
+    now = datetime.now(timezone.utc)
+    failing_candidates = []
+    recovered_candidates = []
+    for site in cfg["websites"]:
+        sid = site["id"]
+        st = site_state(state, sid)
+        failures = int(st.get("consecutive_failures", 0))
+        if failures >= threshold and not st.get("alert_active", False):
+            last_alert = st.get("last_alert_at")
+            cooled = True
+            if last_alert:
+                try:
+                    last_dt = datetime.fromisoformat(last_alert.replace("Z", "+00:00"))
+                    if last_dt.tzinfo is None: last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    cooled = (now - last_dt).total_seconds() >= cooldown_hours * 3600
+                except Exception: cooled = True
+            if cooled: failing_candidates.append((sid, site["name"], failures, st.get("last_error")))
+        elif failures == 0 and st.get("alert_active", False): recovered_candidates.append((sid, site["name"]))
+    if failing_candidates:
+        lines = ["⚠️ <b>Site Failure Alert</b>", "", f"{len(failing_candidates)} site(s) failing:", ""]
+        for sid, name, count, err in failing_candidates[:10]:
+            lines.append(f"• <b>{html.escape(name)}</b> — {count} fails")
+            if err: lines.append(f"  <i>{html.escape(str(err)[:100])}</i>")
+        ok, _permanent, detail = send_telegram(token, chat_id, "\n".join(lines))
+        if ok:
+            for sid, _name, _count, _err in failing_candidates:
+                st = site_state(state, sid); st["alert_active"] = True; st["last_alert_at"] = utc_now()
+        else: print(f"[WARN] Site failure alert not delivered: {detail}", file=sys.stderr)
+    if recovered_candidates:
+        lines = ["✅ <b>Site Recovery</b>", "", f"{len(recovered_candidates)} site(s) recovered:", ""]
+        for sid, name in recovered_candidates[:10]: lines.append(f"• {html.escape(name)}")
+        ok, _permanent, detail = send_telegram(token, chat_id, "\n".join(lines))
+        if ok:
+            for sid, _name in recovered_candidates:
+                st = site_state(state, sid); st["alert_active"] = False; st["last_recovery_at"] = utc_now()
+        else: print(f"[WARN] Site recovery alert not delivered: {detail}", file=sys.stderr)
+
+
+def local_score(title, url, context, keywords):
+    text = f"{title} {url} {context}".lower()
+    return sum(1 for kw in keywords if kw and kw in text)
+
+
+def pending_priority(record, keywords, now=None):
+    now = now or datetime.now(timezone.utc)
+    first_seen = _parse_utc_timestamp(record.get("first_seen"))
+    age_days = max(0.0, (now - first_seen).total_seconds() / 86400) if first_seen else 0.0
+    title = " ".join((record.get("explicit_title") or "", record.get("title") or "", record.get("context") or "")).casefold()
+    if any(x in title for x in ("admit card", "exam date", "प्रवेश पत्र", "परीक्षा तिथि", "परीक्षा कार्यक्रम")): urgency = 100
+    elif any(x in title for x in ("result", "रिजल्ट", "परिणाम", "answer key", "उत्तर कुंजी", "merit list", "मेरिट सूची")): urgency = 50
+    else: urgency = 0
+    score = local_score(record.get("title", ""), record.get("url", ""), record.get("context", ""), keywords)
+    age_bonus = min(age_days, 30.0)
+    return urgency + score + age_bonus, age_days
+
+
+_PRECLASS_STRONG = (
+    "admission", "result", "admit card", "answer key", "examination", "exam", "revaluation", "migration", "scholarship", "fee", "syllabus", "timetable", "counselling", "recruitment", "vacancy", "tender", "notice", "notification", "placement", "convocation", "registration", "exam form", "exam schedule", "exam programme", "marksheet", "merit", "advertisement", "प्रवेश", "परिणाम", "प्रवेश पत्र", "उत्तर कुंजी", "परीक्षा", "पुनर्मूल्यांकन", "छात्रवृत्ति", "शुल्क", "भर्ती", "निविदा", "सूचना", "अधिसूचना", "परीक्षा कार्यक्रम", "परीक्षा केंद्र", "परीक्षा फॉर्म",
+    "dy. director", "deputy director", "principal", "associate dean", "backlog",
+    "on contractual basis", "on contract basis", "for the post of",
+    "अनुबंध के आधार पर", "पद के लिए",
+    "semester calendar", "academic calendar", "award of degree", "list of documents", "not qualified",
+)
+_PRECLASS_NAV_ONLY = ("photo gallery", "video gallery", "site map", "web policies", "screen reader", "feedback", "anti-ragging", "grievance cell")
+_DEFAULT_EXCLUDED_TITLE_SIGNALS = ("gst return", "income tax", "annual report", "balance sheet", "minutes of meeting", "right to information", "rti application")
+
+
+def _matched_excluded_title_signal(title, signals=None):
+    text = re.sub(r"\s+", " ", str(title or "").casefold()).strip()
+    for raw in (signals if signals is not None else _DEFAULT_EXCLUDED_TITLE_SIGNALS):
+        signal = re.sub(r"\s+", " ", str(raw or "").casefold()).strip()
+        if not signal: continue
+        pattern = r"(?<!\w)" + r"\s+".join(re.escape(part) for part in signal.split()) + r"(?!\w)"
+        if re.search(pattern, text, flags=re.UNICODE): return signal
+    return ""
+
+
+def _keyword_pre_classify(record, excluded_signals=None):
+    # PDFs skip title heuristics — Gemini reads PDF content to classify
+    if record.get("is_pdf", False):
+        if _is_stale_notice(
+            record.get("explicit_title") or record.get("title", ""),
+            "",
+            record.get("url", ""),
+            upload_date=_parse_upload_date(record.get("upload_date")),
+            pdf_text=record.get("pdf_text", "")
+        ):
+            return False
+        return None
+
+    if _is_stale_notice(
+        record.get("explicit_title") or record.get("title", ""),
+        "",
+        record.get("url", ""),
+        upload_date=_parse_upload_date(record.get("upload_date")),
+        pdf_text=record.get("pdf_text", "")
+    ): return False
+
+    title_for_exclusion = " ".join((record.get("explicit_title") or "", record.get("title") or "")).casefold()
+    if _matched_excluded_title_signal(title_for_exclusion, excluded_signals): return False
+
+    title = " ".join((record.get("explicit_title") or "", record.get("title") or "")).casefold()
+
+    if _is_generic_title(title): return False
+    words = title.split()
+    if len(re.findall(r'(?:►|»|›|→|▸|▶)', title)) >= 1:
+        print(f"[NAV-FILTER] arrow: {title[:80]}", file=sys.stderr)
+        return False
+    if len(words) >= 8:
+        date_prefixed = bool(re.match(r'^\s*\d{1,2}[-/.]\d{1,2}[-/.]\d{4}\b', title))
+        if not date_prefixed:
+            strong_notice_patterns = [
+                r'\b(?:admission|result|admit card|answer key|examination|revaluation|scholarship|timetable|syllabus|recruitment|tender|counselling|registration|convocation|migration|interview|appointment|apprentice|goods|product|services|supply|purchase|installation|procurement|quotation|bid|rfp|eoi|nit|camc|amc|kva|equipment|machinery|hardware|software|panel|webinar|workshop|seminar|conference|symposium|ceremony|graduation|colloquium|conclave|principal|director|dean)\b',
+                r'\b(?:notice|notification)\s+(?:for|regarding|about)\b',
+                r'\b(?:apply|application|form[\s-]?fill|fee[\s-]?payment)\s+(?:date|last|deadline|online)\b',
+                r'\b(?:advertisement|advt\.?)\s+for\s+the\s+post\b',
+                r'\b(?:semester\s+calendar|academic\s+calendar|award\s+of\s+degree|list\s+of\s+documents|not\s+qualified)\b',
+            ]
+            if not any(re.search(p, title) for p in strong_notice_patterns):
+                print(f"[NAV-FILTER] long-no-notice: {title[:80]}", file=sys.stderr)
+                return False
+    for i in range(len(words) - 1):
+        if words[i] == words[i + 1] and words[i] in _NAV_SIGNALS:
+            print(f"[NAV-FILTER] repeat-nav: {title[:80]}", file=sys.stderr)
+            return False
+    if re.match(r'^about\s+(?:us|capital\s+university|the\s+university|the\s+institute|the\s+college)\b', title):
+        print(f"[NAV-FILTER] about-prefix: {title[:80]}", file=sys.stderr)
+        return False
+    nav_count = _count_nav_signals(title)
+    if nav_count >= 3 and len(words) <= 10:
+        print(f"[NAV-FILTER] dense-nav({nav_count}): {title[:80]}", file=sys.stderr)
+        return False
+    if re.search(r'\bcall\s+us\b|\bemail\s+[\w.+-]+@[\w.-]+\.\w{2,}|\bphone\s*[:\-]?\s*\d{6,}|\bwhatsapp\b', title, re.I):
+        print(f"[NAV-FILTER] contact-page: {title[:80]}", file=sys.stderr)
+        return False
+    if any(sig in title for sig in _PRECLASS_STRONG): return True
+    url = (record.get("url") or "").casefold()
+    title_is_nav = any(sig in title for sig in _PRECLASS_NAV_ONLY)
+    has_notice_signal = any(sig in title for sig in _PRECLASS_STRONG) or any(sig in title for sig in ("notice", "notification", "सूचना", "आवेदन", "advertisement"))
+    if title_is_nav and not has_notice_signal and not _is_notice_document_url(url): return False
+    return None
+
+
+def item_id(site_id, url, title="", context=""):
+    raw = f"{site_id}|{canonical_identity_url(url)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _normalize_title(title): return re.sub(r"[^\w\s]", " ", (title or "").lower()).strip()
+
+
+def build_site_index(state):
+    index = {}
+    permanent = {}
+    for iid, record in state.get("items", {}).items():
+        if not isinstance(record, dict): continue
+        sid = record.get("site_id")
+        if not sid: continue
+        row = (iid, record.get("title", ""), record.get("url", ""))
+        target = permanent if record.get("status") == "permanent_error" else index
+        target.setdefault(sid, []).append(row)
+    for sid, rows in permanent.items(): index.setdefault(sid, []).extend(rows)
+    return index
+
+
+def find_url_match(site_items, url):
+    target = canonical_identity_url(url)
+    if not target: return None
+    for iid, _title, existing_url in site_items or []:
+        if canonical_identity_url(existing_url) == target: return iid
+    return None
+
+
+def _duplicate_alias_slug(url):
+    try:
+        path = unquote(urlparse(url).path or "").rstrip("/")
+        slug = path.rsplit("/", 1)[-1].casefold()
+        slug = re.sub(r"\.(?:pdf|html?|aspx?|php)$", "", slug)
+        slug = re.sub(r"(?:[-_ ](?:copy|duplicate|duplicated|download|downloaded|final-copy))+$", "", slug)
+        return re.sub(r"[^a-z0-9]+", "", slug)
+    except Exception: return ""
+
+
+def find_fuzzy_match(site_items, title, url):
+    if not site_items or not title: return None
+    new_title = _normalize_title(title)
+    new_slug = _duplicate_alias_slug(url)
+    if len(new_title) < 12 or len(new_slug) < 8: return None
+    for iid, existing_title, existing_url in site_items:
+        old_slug = _duplicate_alias_slug(existing_url)
+        if not old_slug or old_slug != new_slug: continue
+        old_title = _normalize_title(existing_title)
+        if len(old_title) >= 12 and fuzz.token_sort_ratio(new_title, old_title) >= FUZZY_CROSS_PATH_THRESHOLD: return iid
+    return None
+
+
+def _remember_sent_fingerprint(state, record, iid=None):
+    """Persist compact PDF and HTML fingerprints outside the prunable item history."""
+    if not isinstance(record, dict):
+        return
+    item_id = str(iid or record.get("_item_id") or "")[:100]
+    stamp = record.get("sent_at") or record.get("terminal_at") or record.get("first_seen") or utc_now()
+    title = clean_text(str(record.get("title") or ""), 120)
+    site_id = clean_text(str(record.get("site_id") or ""), 60)
+
+    # Keep PDF/content hashes in their own index, independent of full state.items.
+    kind = record.get("pdf_hash_kind")
+    fingerprint = record.get("pdf_hash")
+    if fingerprint and kind:
+        index = state.setdefault("sent_fingerprints", {})
+        key = f"{kind}:{fingerprint}"
+        existing = index.get(key) if isinstance(index.get(key), dict) else {}
+        existing_date = existing.get("d") if str(existing.get("i", "")) == item_id else None
+        index[key] = {"t": title, "s": site_id, "d": str(existing_date or stamp)[:40], "i": item_id}
+
+    # HTML notices do not always have downloadable PDFs. Keep an independent stable
+    # title+canonical-URL fingerprint so pruning old full records does not re-send them.
+    html_hash = _html_content_hash(record.get("title", ""), record.get("context", ""), record.get("url", ""))
+    if html_hash:
+        html_index = state.setdefault("html_fingerprints", {})
+        existing = html_index.get(html_hash) if isinstance(html_index.get(html_hash), dict) else {}
+        existing_date = existing.get("d") if str(existing.get("i", "")) == item_id else None
+        html_index[html_hash] = {
+            "t": title,
+            "s": site_id,
+            "d": str(existing_date or stamp)[:40],
+            "i": item_id,
+        }
+
+
+def _is_duplicate_by_pdf_hash(state, record, exclude_iid=None):
+    new_hash = record.get("pdf_hash")
+    new_kind = record.get("pdf_hash_kind")
+    if not new_hash or not new_kind:
+        new_hash = _html_content_hash(record.get("title", ""), record.get("context", ""), record.get("url", ""))
+        new_kind = "html-v2" if new_hash.startswith("html-v2:") else "html-v1"
+    if not new_hash:
+        return None
+    new_title_norm = _normalize_title(record.get("title", ""))
+
+    # PDF fingerprints are global across universities and survive item pruning.
+    if not str(new_kind).startswith("html-"):
+        indexed = state.get("sent_fingerprints", {}).get(f"{new_kind}:{new_hash}")
+        if isinstance(indexed, dict) and str(indexed.get("i", "")) != str(exclude_iid or ""):
+            return indexed.get("t") or "previously sent identical PDF"
+    else:
+        # Current HTML identity uses title + canonical URL, ignoring volatile context.
+        indexed = state.get("html_fingerprints", {}).get(new_hash)
+        if isinstance(indexed, dict) and str(indexed.get("i", "")) != str(exclude_iid or ""):
+            indexed_title = _normalize_title(indexed.get("t", ""))
+            if new_title_norm and indexed_title and fuzz.token_sort_ratio(new_title_norm, indexed_title) >= 85:
+                return indexed.get("t") or "previously sent identical HTML notice"
+        # Compatibility: old state files used title + context (html-v1). Preserve those
+        # entries so the first deployment of this fix does not forget previously sent items.
+        legacy_hash = _legacy_html_content_hash(record.get("title", ""), record.get("context", ""))
+        legacy = state.get("html_fingerprints", {}).get(legacy_hash) if legacy_hash else None
+        if isinstance(legacy, dict) and str(legacy.get("i", "")) != str(exclude_iid or ""):
+            legacy_title = _normalize_title(legacy.get("t", ""))
+            if new_title_norm and legacy_title and fuzz.token_sort_ratio(new_title_norm, legacy_title) >= 85:
+                return legacy.get("t") or "previously sent legacy HTML notice"
+
+    # Compatibility fallback for older state.json records and fuzzy legacy matches.
+    for other_iid, other in state.get("items", {}).items():
+        if other_iid == exclude_iid or not isinstance(other, dict):
+            continue
+        if other.get("status") != "sent":
+            continue
+        if str(new_kind).startswith("html-"):
+            other_hash = _html_content_hash(other.get("title", ""), other.get("context", ""), other.get("url", ""))
+        else:
+            if other.get("pdf_hash_kind") != new_kind:
+                continue
+            other_hash = other.get("pdf_hash")
+        if not other_hash or other_hash != new_hash:
+            continue
+        if str(new_kind).startswith("html-"):
+            other_title_norm = _normalize_title(other.get("title", ""))
+            if not new_title_norm or not other_title_norm or fuzz.token_sort_ratio(new_title_norm, other_title_norm) < 85:
+                continue
+        return other.get("title") or other_iid
+    return None
+
+
+def extract_candidates(html_text, page_url, site, scan):
+    soup = BeautifulSoup(html_text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg", "template"]): tag.decompose()
+    keywords = list(dict.fromkeys(scan["keywords"] + site.get("keywords", [])))
+    out = []
+    seen = set()
+
+    for a in soup.find_all("a", attrs={"ng-href": True}):
+        ng_href = (a.get("ng-href") or "").strip()
+        if not ng_href or ng_href.startswith("{{"): continue
+        if not a.get("href"):
+            a["href"] = ng_href
+
+    for a in soup.find_all("a", href=True):
+        href = _canonical_spa_url(urljoin(page_url, a.get("href", "")))
+        if not is_http_url(href) or not same_host(page_url, href): continue
+        if _is_navigation_url(href): continue
+        if _is_rims_non_notice_url(href):
+            print(f"[FILTER] Ignored RIMS service URL: {href[:120]}", file=sys.stderr)
+            continue
+
+        title = clean_text(a.get_text(" ", strip=True), 300)
+        parent = a.find_parent("tr")
+        if parent is None: parent = a.find_parent(["li", "article", "section"])
+        if parent is None: parent = a.find_parent(["div", "td"])
+        context = clean_text(parent.get_text(" ", strip=True) if parent else "", 700)
+
+        if _is_generic_title(title) or len(title) < 5:
+            context_parts = re.split(r"[|\n\r\t]+", context)
+            context_title = ""
+            for part in context_parts:
+                part = clean_text(part, 200)
+                if len(part) >= 8 and not _is_generic_title(part) and not _is_language_selector(part):
+                    context_title = part
+                    break
+            if not context_title or _is_generic_title(context_title):
+                walker = parent
+                for _ in range(3):
+                    if not walker: break
+                    walker = walker.parent
+                    if not walker: break
+                    for htag in ("h1", "h2", "h3", "h4"):
+                        h = walker.find(htag)
+                        if h:
+                            htext = clean_text(h.get_text(" ", strip=True), 300)
+                            if (len(htext) >= 5 and not _is_generic_title(htext)
+                                and not _looks_like_menu_dump(htext) and not _is_garbage_title(htext)):
+                                context_title = htext
+                                break
+                    if context_title: break
+            title = context_title or _title_from_url(href, min_len=5) or ""
+            if not title or _is_generic_title(title):
+                is_pdf_href = bool(is_pdf(href) or _looks_like_pdf_url(href))
+                if is_pdf_href:
+                    filename_title = _filename_to_title(href)
+                    if filename_title:
+                        title = filename_title
+                    else:
+                        path_slug = unquote(urlparse(href).path or "").rstrip("/").rsplit("/", 1)[-1]
+                        if path_slug and len(path_slug) >= 3:
+                            title = clean_text(f"PDF: {path_slug}", 300)
+                        else:
+                            title = f"PDF Document ({hashlib.sha256(href.encode()).hexdigest()[:8]})"
+                if not title or _is_generic_title(title): continue
+
+        if _is_language_selector(title):
+            parent_text = clean_text(parent.get_text(" ", strip=True) if parent else "", 300)
+            for lang in _LANGUAGE_SELECTOR_TITLES: parent_text = re.compile(re.escape(lang), re.IGNORECASE).sub("", parent_text).strip()
+            parent_text = clean_text(parent_text, 300)
+            if (parent_text and not _is_language_selector(parent_text) and not _is_generic_title(parent_text) and len(parent_text) >= 8): title = parent_text
+            else:
+                url_title = _title_from_url(href, min_len=8)
+                if url_title: title = url_title
+                else: continue
+
+        if len(title) < 20 and context:
+            parts = re.split(r"[|\-–—:]", context)
+            for p in parts:
+                p = clean_text(p.strip(), 200)
+                if (len(p) >= 20 and not _is_generic_title(p)
+                        and not _is_language_selector(p)
+                        and not _looks_like_menu_dump(p)
+                        and not _looks_like_rims_menu_dump(p, href)):
+                    title = p
+                    break
+
+        if _looks_like_rims_menu_dump(title, href):
+            if not _is_notice_document_url(href):
+                print(f"[FILTER] Ignored RIMS navigation-text candidate: {title[:100]!r}", file=sys.stderr)
+                continue
+            replacement = _filename_to_title(href) or _title_from_url(href, min_len=8)
+            if replacement and not _looks_like_rims_menu_dump(replacement, href):
+                title = replacement
+            else:
+                title = f"RIMS Notice Document {hashlib.sha256(href.encode()).hexdigest()[:8]}"
+
+        if _looks_like_nusrl_homepage_dump(title, href):
+            print(f"[FILTER] Ignored NUSRL homepage/navigation text: {title[:100]!r}", file=sys.stderr)
+            continue
+
+        score = local_score(title, href, context, keywords)
+        href_lower = href.lower()
+        is_pdf_link = bool(is_pdf(href) or _looks_like_pdf_url(href))
+        if is_pdf_link:
+            pdf_bonus = 2
+            score = 10
+        elif any(kw in href_lower for kw in ("/notice/", "/notices/", "/document", "/writereaddata/", "/uploadfile/", "/uploads/", "/upload/", "/downloadfile/", "/download_file/", "/getfile/", "/showfile/", "/viewfile/", "/filedownload/", "/files/", "/media/", "/file/", "/attachment/", "/attachments/", "/docs/", "/download/", "/downloads/")): pdf_bonus = 1
+        else: pdf_bonus = 0
+
+        if score <= 0 and pdf_bonus == 0: continue
+        if href in seen: continue
+        seen.add(href)
+        upload_dt = _extract_upload_date(a)
+
+        final_title = clean_text(title, 300)
+        if not final_title or _is_generic_title(final_title): final_title = clean_text(context, 180)
+        if not final_title or _is_generic_title(final_title): final_title = _title_from_url(href, min_len=5)
+        if not final_title: final_title = "Notice"
+
+        out.append({
+            "url": href, "title": final_title, "context": context, "source_page": page_url,
+            "is_pdf": is_pdf_link, "score": score + pdf_bonus, "upload_date": upload_dt.isoformat() if upload_dt else None,
+        })
+
+    # Some universities publish notices as image files (JPG/PNG/WebP) embedded
+    # directly in a notice page rather than as PDF links. Capture those image URLs
+    # when their filename, alt text, or surrounding caption indicates a real notice.
+    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")
+    asset_noise = re.compile(r"(?:logo|favicon|sprite|icon|avatar|banner|slider|carousel|social|facebook|twitter|whatsapp|captcha|payment|seal|emblem)", re.I)
+    for img in soup.find_all("img", src=True):
+        raw_src = (img.get("src") or "").strip()
+        if not raw_src or raw_src.startswith(("data:", "blob:", "javascript:")):
+            continue
+        image_url = canonical_url(urljoin(page_url, raw_src))
+        image_path = unquote(urlparse(image_url).path or "").lower()
+        if not is_http_url(image_url) or not same_host(page_url, image_url):
+            continue
+        if not image_path.endswith(image_exts) or image_url in seen:
+            continue
+        alt = clean_text(img.get("alt", ""), 250)
+        img_title = clean_text(img.get("title", ""), 250)
+        parent = img.find_parent(["tr", "li", "article", "section", "div", "td"]) or img.parent
+        context = clean_text(parent.get_text(" ", strip=True) if parent else "", 700)
+        signal_text = f"{alt} {img_title} {context} {image_path}".lower()
+        if asset_noise.search(image_path) and not any(kw in signal_text for kw in keywords):
+            continue
+        if not any(kw in signal_text for kw in keywords):
+            continue
+        title = alt if alt and not _is_generic_title(alt) else img_title
+        if not title or _is_generic_title(title) or len(title) < 5:
+            title = context
+        if not title or _is_generic_title(title) or len(title) < 8:
+            title = _filename_to_title(image_url)
+        if not title or _is_generic_title(title) or len(title) < 5:
+            continue
+        if _looks_like_menu_dump(title) or _is_garbage_title(title):
+            continue
+        score = max(1, local_score(title, image_url, context, keywords))
+        seen.add(image_url)
+        out.append({
+            "url": image_url, "title": clean_text(title, 300), "context": context,
+            "source_page": page_url, "is_pdf": False, "is_image": True,
+            "score": score, "upload_date": None,
+        })
+
+    if site.get("id") == "vbu-hazaribagh":
+        for btn in soup.find_all(attrs={"onclick": True}):
+            onclick_text = btn.get("onclick", "") or ""
+            if ".pdf" not in onclick_text.lower() and "download" not in onclick_text.lower():
+                continue
+            match = re.search(r"['\"]([^'\"]+\.pdf)['\"]", onclick_text, re.I)
+            if not match:
+                continue
+            pdf_url = _canonical_spa_url(urljoin(page_url, match.group(1)))
+            if not is_http_url(pdf_url) or not same_host(page_url, pdf_url) or pdf_url in seen:
+                continue
+            parent = btn.find_parent(["div", "tr", "li"], class_=re.compile(r"card|notice|item|list|row", re.I)) or btn.parent
+            if not parent:
+                continue
+            title = ""
+            for tag in ["h6", "h5", "h4", "h3", "h2", "h1"]:
+                h_tag = parent.find(tag)
+                if h_tag:
+                    candidate_title = clean_text(h_tag.get_text(" ", strip=True), 300)
+                    if candidate_title and not _is_generic_title(candidate_title):
+                        title = candidate_title
+                        break
+            if not title:
+                b_tag = parent.find(["b", "strong"])
+                if b_tag:
+                    candidate_title = clean_text(b_tag.get_text(" ", strip=True), 300)
+                    if candidate_title and not _is_generic_title(candidate_title):
+                        title = candidate_title
+            if not title:
+                context_text = clean_text(parent.get_text(" ", strip=True), 700)
+                if context_text:
+                    candidate_title = clean_text(context_text.split('\n')[0], 300)
+                    if candidate_title and not _is_generic_title(candidate_title):
+                        title = candidate_title
+            if not title or len(title) < 10 or _is_generic_title(title):
+                continue
+            context = clean_text(parent.get_text(" ", strip=True), 700)
+            upload_dt_vbu = _extract_upload_date(btn)
+            seen.add(pdf_url)
+            out.append({
+                "url": pdf_url, "title": title, "context": context, "source_page": page_url,
+                "is_pdf": True, "score": 10, "upload_date": upload_dt_vbu.isoformat() if upload_dt_vbu else None,
+            })
+
+    def _sort_key(item):
+        dt_str = item.get("upload_date")
+        if dt_str:
+            try:
+                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                return (1, dt.timestamp(), item.get("score", 0))
+            except Exception: pass
+        return (0, 0, item.get("score", 0))
+
+    out.sort(key=_sort_key, reverse=True)
+    out = out[: site.get("max_items_per_site", scan["max_items_per_site"])]
+
+    page_explicit_title = _extract_explicit_title(soup)
+    if page_explicit_title:
+        for row in out:
+            if _is_notice_document_url(row["url"]): row["explicit_title"] = page_explicit_title
+
+    for row in out:
+        if _is_notice_document_url(row["url"]) and _looks_like_menu_dump(row.get("title", "")):
+            cleaned = _cleanup_menu_dump_title(row["title"], url=row["url"], explicit=row.get("explicit_title", ""))
+            if cleaned and cleaned != row["title"]:
+                print(f"[TITLE-CLEANUP] {row['title'][:60]!r} → {cleaned[:60]!r}", file=sys.stderr)
+                row["title"] = cleaned
+
+    return out
+
+
+def discover_from_sitemap(session, base_url, scan):
+    if not scan.get("sitemap_enabled"): return []
+    parsed = urlparse(base_url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    sitemap_url = urljoin(root + "/", "sitemap.xml")
+    try:
+        response = session.get(sitemap_url, timeout=scan["request_timeout_seconds"])
+        if response.status_code >= 400: return []
+        soup = BeautifulSoup(response.text, "xml")
+        urls = []
+        for loc in soup.find_all("loc")[:100]:
+            url = canonical_url(loc.get_text(strip=True))
+            if is_http_url(url) and same_host(base_url, url):
+                if _is_navigation_url(url): continue
+                if any(kw in url.lower() for kw in scan["discovery_keywords"] if kw): urls.append(url)
+        return urls[: scan["max_discovery_pages_per_site"] * 3]
+    except Exception: return []
+
+
+def _robots_allowed(session, url, timeout):
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    if origin not in _ROBOTS_CACHE:
+        parser = RobotFileParser()
+        robots_url = origin + "/robots.txt"
+        try:
+            response = session.get(robots_url, timeout=min(45, timeout), allow_redirects=True)
+            if response.status_code < 400 and response.text:
+                parser.set_url(robots_url)
+                parser.parse(response.text.splitlines())
+                _ROBOTS_CACHE[origin] = parser
+            else: _ROBOTS_CACHE[origin] = None
+        except Exception as exc:
+            print(f"[ROBOTS-FAIL] {robots_url} — {type(exc).__name__}: {exc}", file=sys.stderr)
+            _ROBOTS_CACHE[origin] = None
+    parser = _ROBOTS_CACHE.get(origin)
+    if parser is None: return True
+    try: return parser.can_fetch(USER_AGENT, url)
+    except Exception: return True
+
+
+def _diagnostic_category(reason, pdf_method="", failure_stage=""):
+    """Classify failures globally, using structured stage/method hints when text is absent."""
+    text = str(reason or "").casefold().strip()
+    method = str(pdf_method or "").casefold().strip()
+    stage = str(failure_stage or "").casefold().strip()
+    combined = " ".join(part for part in (text, method, stage) if part)
+
+    # Structured method values are often more reliable than a blank last_error.
+    # Support both method tokens (http_403) and Requests-style errors (403 Client Error).
+    http_match = re.search(r"http[_\s-]?(\d{3})", combined)
+    if not http_match:
+        http_match = re.search(r"\b(403|429|[45]\d\d)\b(?=\s+(?:client|server) error|\s+forbidden|\s+too many requests|$)", combined)
+    if http_match:
+        status = int(http_match.group(1))
+        if status == 403: return "http_403_forbidden"
+        if status == 429: return "http_429_rate_limited"
+        if 500 <= status <= 599: return "http_5xx_server_error"
+        if 400 <= status <= 499: return "http_4xx_client_error"
+    if any(x in combined for x in ("image_ocr_no_text", "pdf_extract_empty", "ocr_no_text", "no usable text", "no text extracted")):
+        return "pdf_extraction_empty"
+    if any(x in combined for x in ("size_limit", "size limit", "too large", "content_length_exceeded")):
+        return "pdf_size_limit"
+    if any(x in combined for x in ("time_limit", "deadline exceeded", "run deadline")):
+        return "request_timeout"
+    if any(x in combined for x in ("playwright_disabled", "playwright is not installed", "browser_type.launch", "playwright unavailable")):
+        return "playwright_unavailable"
+    if any(x in combined for x in ("playwright_nav_error", "playwright_content_error", "playwright_error", "js-fail", "waf-retry-fail", "javascript_render")):
+        return "javascript_render_failed"
+
+    rules = (
+        ("dns_or_connection", ("connectionerror", "name or service not known", "temporary failure in name resolution", "getaddrinfo failed", "connection refused", "connection reset", "failed to establish a new connection")),
+        ("request_timeout", ("timeout", "timed out", "timeouterror", "read timed out", "connect timeout")),
+        ("tls_certificate", ("sslerror", "certificate verify failed", "tls", "wrong version number")),
+        ("robots_or_policy", ("robots.txt", "robots disallow", "not allowed by robots", "blocked by policy")),
+        ("pdf_download_or_parse", ("pdf", "ocr", "attachment", "document", "download_error", "not_pdf", "invalid_pdf")),
+        ("configuration_or_state", ("configuration", "websites.json", "state.json", "invalid site", "jsondecodeerror")),
+    )
+    for category, markers in rules:
+        if any(marker in combined for marker in markers):
+            return category
+    if stage in {"pdf_download", "pdf_extraction", "image_download", "image_ocr"}:
+        return "pdf_download_or_parse"
+    return "other_or_unclassified"
+
+
+def _diagnostic_stage(reason, pdf_method="", failure_stage=""):
+    """Return the most actionable stage label without assuming a stage from site ID."""
+    if failure_stage:
+        return str(failure_stage)[:60]
+    text = f"{reason or ''} {pdf_method or ''}".casefold()
+    if any(x in text for x in ("image_http_", "image_size_limit", "not_image")):
+        return "image_download"
+    if "image_ocr" in text:
+        return "image_ocr"
+    if "http_" in text or "download_error" in text or "size_limit" in text:
+        return "pdf_download" if any(x in text for x in ("pdf", "http_", "download_error", "size_limit")) else "download"
+    if any(x in text for x in ("ocr", "plumber", "extract_empty", "no text")):
+        return "pdf_extraction"
+    if any(x in text for x in ("playwright", "javascript", "js-fail")):
+        return "javascript_render"
+    if any(x in text for x in ("telegram", "bot token", "chat not found")):
+        return "notification_delivery"
+    return "discovery_or_processing"
+
+
+def _set_failure_diagnostic(record, stage, reason, pdf_method=""):
+    """Persist compact structured diagnostics without overwriting business last_error."""
+    record["last_failure_stage"] = str(stage or "unknown")[:60]
+    record["last_failure_reason"] = _safe_error_detail(reason, 350)
+    record["last_failure_category"] = _diagnostic_category(reason, pdf_method, stage)
+
+
+def _safe_error_detail(value, limit=500):
+    """Keep diagnostic messages useful while avoiding multiline/log injection."""
+    cleaned = clean_text(str(value or "No error detail supplied"), limit)
+    return cleaned.replace("\r", " ").replace("\n", " ").replace("\t", " ").replace("\x00", " ")
+
+def discover_site(session, site, scan):
+    base_url = site["url"]
+    timeout = int(site.get("request_timeout_seconds", scan["request_timeout_seconds"]))
+    effective_scan = dict(scan)
+    effective_scan["request_timeout_seconds"] = timeout
+
+    # IIS-friendly headers for RIMS (and any site that opts in).
+    if site.get("id") == "rims-ranchi":
+        session.headers.update({
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+            "Accept-Encoding": "gzip, deflate, br",
+        })
+
+    # Health pre-check is intentionally skipped: each page is tried through
+    # the configured fallback layers below. Failures are still recorded per page.
+
+    max_pages = scan["max_discovery_pages_per_site"]
+    max_archive_pages = scan.get("max_archive_pages_per_site", 5)
+    max_pagination_per_archive = scan.get("max_pagination_per_archive", 3)
+    discovery_keywords = list(dict.fromkeys(scan["discovery_keywords"] + site.get("discovery_keywords", []) + scan["keywords"]))
+    # Conditional stealth: only enable when site explicitly opts in.
+    use_stealth_for_site = bool(site.get("use_stealth_on_block", False))
+
+    direct_urls = []
+    for raw_url in (site.get("direct_urls") or []):
+        if not raw_url or not isinstance(raw_url, str): continue
+        canon = _canonical_spa_url(raw_url.strip())
+        if not is_http_url(canon):
+            print(f"[DIRECT-URL-SKIP] Invalid URL: {raw_url[:100]}", file=sys.stderr)
+            continue
+        if not same_host(base_url, canon):
+            print(f"[DIRECT-URL-SKIP] Off-host URL: {raw_url[:100]}", file=sys.stderr)
+            continue
+        direct_urls.append(canon)
+    if direct_urls:
+        print(f"[DIRECT-URLS] {site['name']}: {len(direct_urls)} priority URL(s) will be scanned first", file=sys.stderr)
+
+    queue = list(direct_urls) + [base_url]
+    queue.extend(discover_from_sitemap(session, base_url, effective_scan))
+    visited = set()
+    archive_visited_count = 0
+    pagination_tracker = {}
+    candidates = {}
+    errors = []
+    successful_pages = 0
+    total_budget = max_pages + max_archive_pages
+    normal_visited_count = 0
+    js_render_count = 0
+
+    while queue and len(visited) < total_budget + len(direct_urls):
+        page = _canonical_spa_url(queue.pop(0))
+        if page in visited or not same_host(base_url, page): continue
+        is_archive = _is_archive_url(page)
+        if is_archive and archive_visited_count >= max_archive_pages: continue
+        if not is_archive and normal_visited_count >= max_pages + len(direct_urls): continue
+        visited.add(page)
+        if is_archive:
+            is_pagination = bool(re.search(r"/page/\d+|[?&](?:page|paged)=\d+", page, re.I))
+            if is_pagination:
+                prefix = re.sub(r"/page/\d+/?", "/", page)
+                prefix = re.sub(r"[?&]page=\d+", "", prefix)
+                prefix = re.sub(r"[?&]paged=\d+", "", prefix).rstrip("?&")
+                current = pagination_tracker.get(prefix, 0)
+                if current >= max_pagination_per_archive: continue
+                pagination_tracker[prefix] = current + 1
+            archive_visited_count += 1
+        else: normal_visited_count += 1
+
+        try:
+            if not _robots_allowed(session, page, timeout):
+                print(f"[ROBOTS-SKIP] {page}", file=sys.stderr)
+                continue
+            domain_delay = float(scan.get("domain_delay_seconds", 1.0) or 0.0)
+            if domain_delay > 0 and visited: time.sleep(min(domain_delay, 10.0))
+            verify_ssl = bool(site.get("verify_ssl", True))
+            if not verify_ssl: print(f"[WARN] TLS certificate verification disabled for configured site: {page}", file=sys.stderr)
+
+            response = None
+            response_text = None
+            response_content = b""
+            rendered_from_waf = False
+            final_url = page
+            content_type = ""
+            scan_layer_used = None
+
+            # ═══════════════════════════════════════════════════════════════
+            # 5-LAYER ADVANCED FALLBACK SYSTEM
+            # L1 curl_cffi -> L2 cloudscraper -> L3 Playwright -> L4 Worker -> L5 ScrapingAnt
+            # ═══════════════════════════════════════════════════════════════
+
+            # LAYER 1: curl_cffi (browser TLS fingerprint impersonation)
+            if curl_requests is not None:
+                try:
+                    r_cffi = curl_requests.get(
+                        page, impersonate="chrome110", timeout=min(20, timeout),
+                        verify=verify_ssl, allow_redirects=True
+                    )
+                    if r_cffi.status_code == 200 and r_cffi.content:
+                        response_text = r_cffi.text
+                        response_content = r_cffi.content
+                        final_url = str(r_cffi.url)
+                        content_type = (r_cffi.headers.get("content-type") or "").lower()
+                        scan_layer_used = "L1-curl_cffi"
+                        print(f"[SCAN-L1] OK: {page[:70]}", file=sys.stderr)
+                    else:
+                        print(f"[SCAN-L1-FAIL] HTTP {r_cffi.status_code}: {page[:70]}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[SCAN-L1-FAIL] {type(e).__name__}: {page[:70]}", file=sys.stderr)
+
+            # LAYER 2: cloudscraper
+            if not response_text and cloudscraper is not None:
+                try:
+                    scraper = cloudscraper.create_scraper(
+                        browser={"browser": "chrome", "platform": "windows", "mobile": False},
+                        delay=2
+                    )
+                    r_cs = scraper.get(
+                        page, timeout=min(25, timeout), verify=verify_ssl,
+                        allow_redirects=True
+                    )
+                    if r_cs.status_code == 200 and r_cs.content:
+                        response_text = r_cs.text
+                        response_content = r_cs.content
+                        final_url = str(r_cs.url)
+                        content_type = (r_cs.headers.get("content-type") or "").lower()
+                        scan_layer_used = "L2-cloudscraper"
+                        print(f"[SCAN-L2] OK: {page[:70]}", file=sys.stderr)
+                    else:
+                        print(f"[SCAN-L2-FAIL] HTTP {r_cs.status_code}: {page[:70]}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[SCAN-L2-FAIL] {type(e).__name__}: {page[:70]}", file=sys.stderr)
+
+            # LAYER 3: Stealth Playwright (JS rendering / WAF retry)
+            if (
+                not response_text and JS_RENDER_ENABLED and _PLAYWRIGHT_AVAILABLE
+                and js_render_count < JS_MAX_RENDER_PER_SITE
+                and site.get("js_render", "auto") != "never"
+            ):
+                try:
+                    rendered_html, rendered_url, js_method = _render_with_playwright(
+                        page, timeout_ms=timeout * 1000,
+                        wait_for_selector=site.get("js_wait_for_selector"),
+                        wait_after_ms=site.get("js_wait_after_ms"),
+                        scroll_bottom=site.get("js_scroll_bottom", JS_SCROLL_TO_BOTTOM),
+                        selector_timeout_ms=site.get("js_selector_timeout_ms"),
+                        ignore_https_errors=not site.get("verify_ssl", True),
+                        use_stealth=True, proxy=None
+                    )
+                    js_render_count += 1
+                    if rendered_html:
+                        response_text = rendered_html
+                        response_content = rendered_html.encode("utf-8", errors="ignore")
+                        final_url = _canonical_spa_url(rendered_url or page)
+                        content_type = "text/html"
+                        rendered_from_waf = True
+                        scan_layer_used = "L3-Playwright"
+                        print(f"[SCAN-L3] OK: {page[:70]} ({js_method})", file=sys.stderr)
+                    else:
+                        print(f"[SCAN-L3-FAIL] Empty render: {page[:70]} ({js_method})", file=sys.stderr)
+                except Exception as e:
+                    print(f"[SCAN-L3-FAIL] {type(e).__name__}: {page[:70]}", file=sys.stderr)
+
+            # LAYER 4: Cloudflare Worker (optional; configure CF_WORKER_URL secret)
+            if not response_text:
+                cf_worker_url = os.getenv("CF_WORKER_URL", "").strip()
+                if cf_worker_url:
+                    try:
+                        proxy_url = cf_worker_url + ("&" if "?" in cf_worker_url else "?") + urlencode({"url": page})
+                        r_cf = requests.get(proxy_url, timeout=min(40, max(10, timeout)))
+                        if r_cf.status_code == 200 and r_cf.content:
+                            response_text = r_cf.text
+                            response_content = r_cf.content
+                            final_url = page
+                            content_type = (r_cf.headers.get("content-type") or "text/html").lower()
+                            scan_layer_used = "L4-Cloudflare-Worker"
+                            print(f"[SCAN-L4] OK via Cloudflare Worker: {page[:70]}", file=sys.stderr)
+                        else:
+                            print(f"[SCAN-L4-FAIL] HTTP {r_cf.status_code}: {page[:70]}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[SCAN-L4-FAIL] {type(e).__name__}: {page[:70]}", file=sys.stderr)
+
+            # LAYER 5: ScrapingAnt (optional; configure SCRAPINGANT_API_KEY secret)
+            if not response_text:
+                sa_api_key = os.getenv("SCRAPINGANT_API_KEY", "").strip()
+                if sa_api_key:
+                    try:
+                        print(f"[SCAN-L5] Trying ScrapingAnt: {page[:60]}", file=sys.stderr)
+                        sa_url = "https://api.scrapingant.com/v2/general?" + urlencode({
+                            "url": page,
+                            "x-api-key": sa_api_key,
+                        })
+                        r_sa = requests.get(sa_url, timeout=min(60, max(15, timeout)))
+                        if r_sa.status_code == 200 and r_sa.content:
+                            response_text = r_sa.text
+                            response_content = r_sa.content
+                            final_url = page
+                            content_type = (r_sa.headers.get("content-type") or "text/html").lower()
+                            scan_layer_used = "L5-ScrapingAnt"
+                            print(f"[SCAN-L5] OK via ScrapingAnt: {page[:70]}", file=sys.stderr)
+                        else:
+                            print(f"[SCAN-L5-FAIL] HTTP {r_sa.status_code}: {page[:70]}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[SCAN-L5-FAIL] {type(e).__name__}: {page[:70]}", file=sys.stderr)
+
+            if not response_text:
+                raise RuntimeError(f"All configured scanning layers failed for {page}")
+
+            print(
+                f"[SCAN-DONE] site_id={site.get('id', 'unknown')} layer={scan_layer_used} "
+                f"bytes={len(response_content)} content_type={content_type[:50]!r}",
+                file=sys.stderr
+            )
+
+            # CRITICAL: Direct PDF / Office document detection before HTML parsing.
+            if content_type:
+                ct_lower = content_type.lower()
+                is_pdf_resp = _looks_like_pdf_response(response_content, ct_lower, final_url)
+                is_office_doc = (
+                    "application/vnd.openxmlformats" in ct_lower
+                    or "application/msword" in ct_lower
+                    or "application/vnd.ms-excel" in ct_lower
+                    or "application/vnd.ms-powerpoint" in ct_lower
+                )
+                if is_pdf_resp:
+                    filename = final_url.rsplit("/", 1)[-1] or "PDF Notice"
+                    candidates[final_url] = {
+                        "url": final_url, "title": clean_text(filename, 300),
+                        "context": "Direct PDF notice", "source_page": page,
+                        "is_pdf": True, "score": 3, "upload_date": None
+                    }
+                    successful_pages += 1
+                    continue
+                if is_office_doc:
+                    filename = final_url.rsplit("/", 1)[-1] or "Document Notice"
+                    candidates[final_url] = {
+                        "url": final_url, "title": clean_text(filename, 300),
+                        "context": "Direct document notice", "source_page": page,
+                        "is_pdf": True, "score": 3, "upload_date": None
+                    }
+                    successful_pages += 1
+                    continue
+                if "html" not in ct_lower and "xhtml" not in ct_lower:
+                    print(f"[SKIP] Non-HTML content-type={ct_lower[:60]!r} at {page}", file=sys.stderr)
+                    continue
+
+            js_mode = site.get("js_render", "auto")
+            source_html = response.text if response is not None else (response_text or "")
+            should_render_js = False if rendered_from_waf else _should_render_js(site, source_html, page)
+
+            if (should_render_js and JS_RENDER_ENABLED and _PLAYWRIGHT_AVAILABLE and js_render_count < JS_MAX_RENDER_PER_SITE):
+                print(f"[JS-RENDER] {page} (mode={js_mode})", file=sys.stderr)
+                rendered_html, rendered_url, js_method = _render_with_playwright(page, timeout_ms=timeout * 1000, wait_for_selector=site.get("js_wait_for_selector"), wait_after_ms=site.get("js_wait_after_ms"), scroll_bottom=site.get("js_scroll_bottom", JS_SCROLL_TO_BOTTOM), selector_timeout_ms=site.get("js_selector_timeout_ms"), ignore_https_errors=not site.get("verify_ssl", True), use_stealth=use_stealth_for_site)
+                js_render_count += 1
+                if rendered_html:
+                    response_text = rendered_html
+                    final_url = _canonical_spa_url(rendered_url)
+                    print(f"[JS-OK] {page[:80]} -> {len(rendered_html)} chars ({js_method})", file=sys.stderr)
+                else:
+                    response_text = response.text if response is not None else (response_text or "")
+                    print(f"[JS-FAIL] {page[:80]}: {js_method}", file=sys.stderr)
+            elif response_text is None: response_text = response.text if response is not None else ""
+
+            if _is_empty_page_text(response_text):
+                successful_pages += 1
+                continue
+
+            found = extract_candidates(response_text, final_url, site, effective_scan)
+            pdf_count = sum(1 for x in found if x.get("is_pdf"))
+            print(f"[PAGE-RESULT] site_id={site.get('id','unknown')} url={page[:120]} candidates={len(found)} pdf_candidates={pdf_count} html_chars={len(response_text)}", file=sys.stderr)
+            for row in found:
+                old = candidates.get(row["url"])
+                if old is None or row["score"] > old["score"]: candidates[row["url"]] = row
+            successful_pages += 1
+
+            soup = BeautifulSoup(response_text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = _canonical_spa_url(urljoin(final_url, a.get("href", "")))
+                if (not is_http_url(href) or not same_host(base_url, href) or href in visited or href in queue): continue
+                if re.search(r"/(login|adminlogin|stdlogin|logout|register|signin|sign-in|search|tag)(/|$)", href, re.I): continue
+                if _is_archive_url(href):
+                    if len(queue) < total_budget * 3: queue.append(href)
+                    continue
+                anchor = clean_text(a.get_text(" ", strip=True), 220).lower()
+                parsed_href = urlparse(href)
+                path = parsed_href.path.lower()
+                route = (parsed_href.fragment or "").replace("!", " ").replace("/", " ")
+                haystack = f"{anchor} {path} {route}"
+                if any(kw in haystack for kw in discovery_keywords if kw):
+                    queue.append(href)
+                    if len(queue) >= total_budget * 2: break
+        except Exception as exc:
+            detail = clean_text(str(exc), 350)
+            errors.append(f"{page}: {detail}")
+            print(f"[SCAN-ERR] id={site.get('id','unknown')} url={page[:160]} error={detail}", file=sys.stderr)
+            print(f"[PAGE-FAILURE-DIAGNOSTIC] site_id={site.get('id','unknown')} category={_diagnostic_category(detail)} exception={type(exc).__name__} url={page[:150]} reason={_safe_error_detail(detail, 300)}", file=sys.stderr)
+
+    values = list(candidates.values())
+    def _final_sort_key(item):
+        dt_str = item.get("upload_date")
+        if dt_str:
+            try:
+                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                return (1, dt.timestamp(), item.get("score", 0))
+            except Exception: pass
+        return (0, 0, item.get("score", 0))
+    values.sort(key=_final_sort_key, reverse=True)
+    return (site["id"], values[: site.get("max_items_per_site", scan["max_items_per_site"])], errors, successful_pages > 0)
+
+
+def scan_site(site, scan): return discover_site(make_session(), site, scan)
+
+
+def _extract_pdf_text_plumber(content):
+    parts = []
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for idx, page in enumerate(pdf.pages[:MAX_PDF_PAGES]):
+                try:
+                    t = page.extract_text() or ""
+                    if t.strip(): parts.append(t)
+                except Exception as exc: print(f"[WARN] Page {idx+1} text extract failed: {exc}", file=sys.stderr)
+                try:
+                    tables = page.extract_tables() or []
+                    for table in tables:
+                        try:
+                            if callable(getattr(table, "extract", None)): rows = table.extract() or []
+                            elif getattr(table, "rows", None) is not None and not isinstance(table, (list, tuple)): rows = table.rows
+                            else: rows = table or []
+                        except Exception: continue
+                        for row in rows:
+                            if hasattr(row, "cells"): row = row.cells
+                            if not isinstance(row, (list, tuple)): continue
+                            cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                            if cells: parts.append(" | ".join(cells))
+                except Exception: pass
+    except Exception as exc: print(f"[WARN] pdfplumber open failed: {exc}", file=sys.stderr)
+    return "\n\n".join(parts)
+
+
+def _extract_pdf_text_rapidocr(content):
+    if not OCR_ENABLED or not _RAPIDOCR_AVAILABLE: return ""
+    ocr = _get_rapidocr()
+    if ocr is None: return ""
+    parts = []
+    doc = None
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+        pages_to_process = min(len(doc), MAX_PDF_PAGES, _OCR_MAX_PAGES)
+        for page_num in range(pages_to_process):
+            try:
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(dpi=OCR_DPI)
+                result, _ = ocr(pix.tobytes("png"))
+                if result:
+                    page_lines = [line[1] for line in result if len(line) > 1]
+                    if page_lines: parts.append("\n".join(page_lines))
+            except Exception as exc: print(f"[WARN] RapidOCR page {page_num+1} failed: {exc}", file=sys.stderr)
+    except Exception as exc: print(f"[WARN] RapidOCR PDF processing failed: {exc}", file=sys.stderr)
+    finally:
+        if doc is not None:
+            try: doc.close()
+            except Exception: pass
+    result_text = "\n\n".join(parts)
+    if result_text and _text_looks_garbage(result_text): return ""
+    return result_text
+
+
+def _extract_pdf_text_tesseract(content):
+    global _TESSERACT_WARNED
+    if not TESSERACT_ENABLED or not _TESSERACT_AVAILABLE:
+        if TESSERACT_ENABLED and not _TESSERACT_AVAILABLE and not _TESSERACT_WARNED:
+            print("[INFO] Tesseract not installed; skipping Hindi fallback.", file=sys.stderr)
+            _TESSERACT_WARNED = True
+        return ""
+    if fitz is None or _PIL_Image is None: return ""
+    parts = []
+    doc = None
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+        pages_to_process = min(len(doc), MAX_PDF_PAGES, _OCR_MAX_PAGES)
+        config = f"--psm {TESSERACT_PSM}" if TESSERACT_PSM else ""
+        for page_num in range(pages_to_process):
+            try:
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(dpi=OCR_DPI)
+                img = _PIL_Image.open(io.BytesIO(pix.tobytes("png")))
+                try:
+                    text = pytesseract.image_to_string(img, lang=TESSERACT_LANG, config=config)
+                    if text.strip(): parts.append(text)
+                finally:
+                    try: img.close()
+                    except Exception: pass
+            except Exception as exc:
+                if not _TESSERACT_WARNED:
+                    print(f"[WARN] Tesseract page {page_num+1} failed: {exc}", file=sys.stderr)
+                    _TESSERACT_WARNED = True
+                break
+    except Exception as exc: print(f"[WARN] Tesseract PDF processing failed: {exc}", file=sys.stderr)
+    finally:
+        if doc is not None:
+            try: doc.close()
+            except Exception: pass
+    result_text = "\n\n".join(parts)
+    if result_text and _text_looks_garbage(result_text): return ""
+    return result_text
+
+
+def _extract_with_gemini_pdf(pdf_bytes):
+    global _GEMINI_QUOTA_EXHAUSTED
+    if not GEMINI_PDF_OCR_ENABLED or not _GEMINI_KEYS_POOL: return ""
+    if _GEMINI_QUOTA_EXHAUSTED: return ""
+    if len(pdf_bytes) > MAX_GEMINI_PDF_BYTES: return ""
+    try:
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        prompt = ("Extract ALL text from this university notice/exam document. May be in Hindi, English, or both. May contain tables. Return extracted text verbatim, preserving structure. Do NOT summarize. Do NOT invent. Just extract the text. Preserve every date and Devanagari character exactly.")
+        payload = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}}]}], "generationConfig": {"temperature": 0.0, "maxOutputTokens": 16384}}
+        for model in _DYNAMIC_MODELS:
+            if model in _DEAD_MODELS: continue
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            for attempt in range(2):
+                response, key_used, reason = _gemini_post_with_rotation(endpoint, payload, timeout=90)
+                if response is None:
+                    if reason == "all_keys_quota_exhausted": _GEMINI_QUOTA_EXHAUSTED = True
+                    return ""
+                if response.status_code == 404:
+                    _DEAD_MODELS.add(model)
+                    break
+                if response.status_code >= 500:
+                    if attempt == 0:
+                        time.sleep(1.5)
+                        continue
+                    break
+                if response.status_code >= 400: break
+                try:
+                    data = response.json()
+                    extracted = _extract_gemini_text(data)
+                    if extracted and len(extracted.strip()) > 50: return extracted
+                    break
+                except Exception: break
+    except Exception as exc: print(f"[WARN] Gemini PDF OCR failed: {type(exc).__name__}", file=sys.stderr)
+    return ""
+
+
+def _text_looks_thin(text):
+    stripped = (text or "").strip()
+    if len(stripped) < OCR_MIN_TEXT_CHARS: return True
+    words = re.findall(r"\w+", stripped, re.UNICODE)
+    if len(words) < 20: return True
+    if not re.search(r"\d", stripped): return True
+    char_counts = Counter(stripped.lower())
+    if char_counts:
+        most_common_count = char_counts.most_common(1)[0][1]
+        if most_common_count > len(stripped) * 0.5: return True
+    return False
+
+
+def _text_looks_garbage(text):
+    if not text: return True
+    stripped = text.strip()
+    if len(stripped) < 20: return True
+    valid = 0
+    weird = 0
+    for c in stripped:
+        if c.isalnum() or c.isspace(): valid += 1
+        elif "\u0900" <= c <= "\u097F": valid += 1
+        elif c in ".,:;/-()[]{}\"'!?%&@#*+=<>|": valid += 1
+        else: weird += 1
+    if weird > len(stripped) * 0.05: return True
+    words = re.findall(r"\w+", stripped, re.UNICODE)
+    if len(words) < 5: return True
+    avg_len = sum(len(w) for w in words) / len(words)
+    if avg_len > 20: return True
+    if re.search(r"[bcdfghjklmnpqrstvwxz]{5,}", stripped, re.I): return True
+    return False
+
+
+_TITLE_KEYWORDS = ("निविदा", "विज्ञापन", "सूचना", "नोटिस", "भर्ती", "परीक्षा", "परिणाम", "आवेदन", "रिक्त", "पद", "नियुक्ति", "चयन", "शुद्धिपत्र", "corrigendum", "amendment", "notice", "tender", "advertisement", "recruitment", "vacancy", "result", "notification", "circular", "admission", "exam", "revaluation", "migration", "scholarship", "fee", "syllabus", "timetable", "counselling", "placement", "convocation", "registration", "प्रवेश", "परिणाम", "प्रवेश पत्र", "उत्तर कुंजी", "परीक्षा", "पुनर्मूल्यांकन", "छात्रवृत्ति", "शुल्क")
+_BOILERPLATE_HINTS = ("पता:", "address:", "फोन", "phone", "email", "e-mail", "website", "वेबसाइट", "दूरभाष", "fax", "फैक्स")
+
+
+def _score_pdf_title_line(line, index):
+    if not line: return -1
+    ln = line.strip()
+    if len(ln) < 15: return -1
+    if re.match(r"^[\d\s/\-:.()|]+$", ln): return -1
+    if _is_generic_title(ln) or _is_language_selector(ln): return -1
+    low = ln.lower()
+    score = min(len(ln), 120)
+    for kw in _TITLE_KEYWORDS:
+        if kw in low:
+            score += 60
+            break
+    if re.search(r"(?:संख्या|no\.?|number)[\s:/\-]*[\w/\-]{2,}", low): score += 40
+    if any(bad in low for bad in _BOILERPLATE_HINTS): score -= 60
+    score += max(0, 10 - index)
+    return score
+
+
+def _extract_pdf_title_and_summary(raw_pdf_text, fallback_title=""):
+    if not raw_pdf_text: return fallback_title, ""
+    current_clean = clean_text(fallback_title or "", 300)
+    current_lower = current_clean.lower()
+    lines = [ln.strip() for ln in raw_pdf_text.splitlines() if ln.strip()][:30]
+    scored = []
+    for idx, ln in enumerate(lines):
+        sc = _score_pdf_title_line(ln, idx)
+        if sc > 0: scored.append((sc, idx, ln))
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    better_title = current_clean
+    for _sc, _idx, ln in scored:
+        ln_low = ln.lower()
+        if ln_low == current_lower: continue
+        if len(ln) > len(current_clean) + 5:
+            better_title = clean_text(ln, 300)
+            break
+    summary = ""
+    for _sc, _idx, ln in scored:
+        if ln.lower() == better_title.lower(): continue
+        if re.search(r"\d", ln):
+            summary = clean_text(ln, 200)
+            break
+    if not summary:
+        for _sc, _idx, ln in scored:
+            if ln.lower() != better_title.lower():
+                summary = clean_text(ln, 200)
+                break
+    return better_title, summary
+
+
+def download_pdf_content(pdf_url, timeout=30, verify_ssl=True, deadline=None):
+    content = _cache_get(pdf_url)
+    if content is None:
+        try:
+            session = make_session()
+            try:
+                content, actual_url, method = _download_with_pdf_resolution(session, pdf_url, timeout, verify_ssl=verify_ssl)
+            finally:
+                session.close()
+            if not content: return None, "", False, method, ""
+            if len(content) > MAX_PDF_SEND_BYTES: return None, "", False, "size_limit", ""
+            _cache_put(pdf_url, content)
+            if actual_url and actual_url != pdf_url: _cache_put(actual_url, content)
+        except Exception as exc:
+            print(f"[WARN] PDF download failed for {pdf_url}: {exc}", file=sys.stderr)
+            return None, "", False, "download_error", ""
+    content_hash = hashlib.sha256(content).hexdigest()
+    cached = _get_ocr_cache(content_hash)
+    if cached:
+        cached_cleaned, cached_raw, cached_method = cached
+        print(f"[OCR-CACHE] Same content, skipping OCR ({len(cached_cleaned)} chars, was={cached_method}): {pdf_url[:70]}", file=sys.stderr)
+        return (content, cached_cleaned, cached_method != "plumber", cached_method, cached_raw)
+    ocr_start = time.monotonic()
+    def _ocr_deadline_hit():
+        if deadline and time.monotonic() > deadline: return True
+        if time.monotonic() - ocr_start > MAX_PDF_OCR_SECONDS:
+            print(f"[OCR-CAP] Per-PDF OCR time cap ({MAX_PDF_OCR_SECONDS}s) hit", file=sys.stderr)
+            return True
+        return False
+    raw_text = _extract_pdf_text_plumber(content)
+    extraction_method = "plumber"
+    if _text_looks_thin(raw_text):
+        print(f"[INFO] PDF thin ({len(raw_text)} chars). Starting OCR pipeline...", file=sys.stderr)
+        if GEMINI_PDF_OCR_ENABLED and not _GEMINI_QUOTA_EXHAUSTED and not _ocr_deadline_hit():
+            print("[OCR] Trying Gemini...", file=sys.stderr)
+            gemini_text = _extract_with_gemini_pdf(content)
+            if gemini_text and not _text_looks_garbage(gemini_text) and len(gemini_text.strip()) > len(raw_text.strip()):
+                raw_text = f"{raw_text}\n\n--- GEMINI OCR ---\n\n{gemini_text}" if raw_text.strip() else gemini_text
+                extraction_method = "gemini"
+                print(f"[INFO] Gemini OCR succeeded ({len(gemini_text)} chars)", file=sys.stderr)
+        if extraction_method == "plumber" and OCR_ENABLED and _RAPIDOCR_AVAILABLE and not _ocr_deadline_hit():
+            print("[OCR] Trying RapidOCR (Devanagari)...", file=sys.stderr)
+            rocr_text = _extract_pdf_text_rapidocr(content)
+            if rocr_text and not _text_looks_garbage(rocr_text) and len(rocr_text.strip()) > len(raw_text.strip()):
+                raw_text = f"{raw_text}\n\n--- RAPIDOCR ---\n\n{rocr_text}" if raw_text.strip() else rocr_text
+                extraction_method = "rapidocr"
+                print(f"[INFO] RapidOCR succeeded ({len(rocr_text)} chars)", file=sys.stderr)
+        if extraction_method == "plumber" and TESSERACT_ENABLED and _TESSERACT_AVAILABLE and not _ocr_deadline_hit():
+            print("[OCR] Trying Tesseract...", file=sys.stderr)
+            tess_text = _extract_pdf_text_tesseract(content)
+            if tess_text and not _text_looks_garbage(tess_text) and len(tess_text.strip()) > len(raw_text.strip()):
+                raw_text = f"{raw_text}\n\n--- TESSERACT ---\n\n{tess_text}" if raw_text.strip() else tess_text
+                extraction_method = "tesseract"
+                print(f"[INFO] Tesseract succeeded ({len(tess_text)} chars)", file=sys.stderr)
+    cleaned = clean_text(raw_text, MAX_PDF_TEXT_CHARS)
+    raw_for_title = raw_text[:MAX_PDF_RAW_TEXT_CHARS]
+    if cleaned and len(cleaned) >= 20:
+        _put_ocr_cache(content_hash, cleaned, raw_for_title, extraction_method)
+    return (content, cleaned, extraction_method != "plumber", extraction_method, raw_for_title)
+
+
+def keyword_fallback(items):
+    """Conservative no-Gemini classifier: avoid spam and preserve ambiguous cases for review.
+
+    Never marks every candidate important. High-confidence send candidates need
+    a specific notice signal in the title/explicit title (or a clear notice URL
+    plus matching body signal). Generic navigation, marketing, archive, and
+    footer-only keyword matches are rejected. Ambiguous candidates are queued
+    for review instead of being silently treated as important or junk.
+    """
+    result = {}
+    strong = tuple(str(kw).casefold() for kw in STRONG_KEYWORDS if kw)
+    noise_patterns = re.compile(
+        r"\b(home|about us|contact us|gallery|campus life|visit campus|read more|"
+        r"photo gallery|archive|archives|pagination|language|login|sign in|"
+        r"privacy policy|terms and conditions|copyright|all rights reserved|"
+        r"upcoming event calendar)\b|(?:►|»|›|→|▸|▶)", re.I)
+    for index, item in enumerate(items):
+        title = clean_text(item.get("explicit_title") or item.get("title") or "", 300)
+        url = str(item.get("url") or "")
+        context = clean_text(item.get("context") or "", 2500)
+        pdf_text = clean_text(item.get("pdf_text") or "", 3500)
+        pdf_hint = clean_text(item.get("pdf_summary_hint") or "", 300)
+        title_norm = re.sub(r"\s+", " ", title).strip()
+        title_lower = title_norm.casefold()
+        url_path = unquote(urlparse(url).path).replace("-", " ").replace("_", " ").casefold()
+        # Keep the primary decision anchored to title/URL, not arbitrary footer text.
+        title_signal = any(kw in title_lower for kw in strong)
+        url_signal = any(kw in url_path for kw in strong)
+        body_text = f"{context} {pdf_hint} {pdf_text}".casefold()
+        body_signal = any(kw in body_text for kw in strong)
+        combined_for_noise = f"{title_lower} {url_path}"
+        generic = (not title_norm or _is_generic_title(title_norm) or bool(noise_patterns.search(combined_for_noise))
+                   or _matched_excluded_title_signal(title_norm))
+        # URL alone is insufficient; it must pair with a meaningful title/body.
+        high_confidence = not generic and (title_signal or (url_signal and body_signal))
+        if high_confidence:
+            category = "notice"
+            if any(k in title_lower for k in ("admission", "प्रवेश")): category = "admission"
+            elif any(k in title_lower for k in ("result", "परिणाम", "रिजल्ट")): category = "result"
+            elif any(k in title_lower for k in ("admit card", "प्रवेश पत्र")): category = "admit_card"
+            elif any(k in title_lower for k in ("answer key", "उत्तर कुंजी")): category = "answer_key"
+            elif any(k in title_lower for k in ("revaluation", "पुनर्मूल्यांकन")): category = "revaluation"
+            elif any(k in title_lower for k in ("migration", "माइग्रेशन", "provisional certificate", "duplicate marksheet")): category = "migration_certificate"
+            elif any(k in title_lower for k in ("fee", "शुल्क")): category = "fee_structure"
+            elif any(k in title_lower for k in ("academic calendar", "शैक्षणिक कैलेंडर")): category = "academic_calendar"
+            elif any(k in title_lower for k in ("syllabus", "पाठ्यक्रम")): category = "syllabus"
+            elif any(k in title_lower for k in ("timetable", "time table", "समय सारिणी", "programme", "program")): category = "timetable"
+            elif any(k in title_lower for k in ("scholarship", "छात्रवृत्ति")): category = "scholarship"
+            elif any(k in title_lower for k in ("placement", "प्लेसमेंट")): category = "placement"
+            elif any(k in title_lower for k in ("tender", "निविदा")): category = "tender"
+            elif any(k in title_lower for k in ("recruitment", "vacancy", "भर्ती")): category = "vacancy"
+            elif any(k in title_lower for k in ("exam schedule", "examination programme", "परीक्षा कार्यक्रम")): category = "exam_schedule"
+            summary = pdf_hint if pdf_hint and pdf_hint.casefold() != title_lower else context
+            result[str(index)] = {"important": True, "category": category,
+                "summary": clean_text(summary, 180), "title_hi": None,
+                "unverified": True, "confidence": "medium", "pre_classified": False,
+                "fallback_reason": "specific_title_signal"}
+        elif generic:
+            result[str(index)] = {"important": False, "category": "other", "summary": "",
+                "title_hi": None, "unverified": True, "confidence": "high",
+                "pre_classified": False, "fallback_reason": "navigation_or_low_relevance_noise"}
+        else:
+            # Do not silently drop a possible genuine notice when keywords are weak.
+            # The main pipeline adds needs_review items to its review queue.
+            summary = pdf_hint if pdf_hint and pdf_hint.casefold() != title_lower else context
+            result[str(index)] = {"important": False, "category": "other",
+                "summary": clean_text(summary, 180), "title_hi": None,
+                "unverified": True, "confidence": "low", "ambiguous": True,
+                "needs_review": True, "pre_classified": False,
+                "fallback_reason": "ambiguous_no_gemini_review_required"}
+    return result
+
+
+def _build_prompt(prompt_items):
+    return (
+        "You classify and extract details from links on official Jharkhand university websites (nic.in and .ac.in). Return JSON only using the exact schema below.\n\n"
+        "CRITICAL — set important=false for ALL of these:\n- Language selector links\n- Category listing pages, archive pages, pagination pages\n- Navigation pages (Home, Contact, About, Gallery)\n- Pages with titles like 'Archive', 'More', '»', numbers, empty\n- Generic descriptions like 'listing page', 'category page'\n\n"
+        "Set important=true ONLY for genuine, specific notices — admission, result, admit card, answer key, exam schedule, revaluation, migration/certificate, fee structure, academic calendar, syllabus, timetable, scholarship, placement, recruitment, tender, etc.\n\n"
+        "For EACH item determine:\n1. important (true/false)\n2. category\n3. summary (<= 150 chars)\n4. title_hi\n\n"
+        "IMPORTANT: If 'pdf_text' is provided, treat it as PRIMARY source.\nDo NOT invent facts. Use null when unsure.\n\n"
+        "Schema:\n"
+        '{"items":[{'
+        '"id":"0","important":true,"category":"admission","summary":"...","title_hi":"...",'
+        '"reference_number":null,"issuing_authority":null,"issuing_date":null,'
+        '"contact_person":null,"contact_number":null,"email":null,"helpline_number":null,"official_address":null,"important_instructions":null,'
+        '"course_name":null,"course_level":null,"session":null,"admission_mode":null,"entrance_exam_name":null,"eligibility":null,"eligibility_marks":null,'
+        '"age_criteria":null,"application_fee":null,"fee_structure":null,"total_seats":null,"reservation_details":null,"apply_start_date":null,'
+        '"last_date":null,"counselling_date":null,"apply_link":null,"prospectus_link":null,"documents_required":null,"hostel_available":null,'
+        '"result_for":null,"exam_name":null,"semester":null,"result_date":null,"result_link":null,"result_type":null,"merit_list_link":null,'
+        '"cutoff_marks":null,"total_selected":null,"next_stage":null,"next_stage_date":null,"rechecking_last_date":null,"rechecking_link":null,"rechecking_fee":null,'
+        '"exam_date":null,"exam_time":null,"exam_duration":null,"exam_center":null,"reporting_time":null,"download_start_date":null,"download_last_date":null,'
+        '"admit_card_link":null,"instructions":null,"total_questions":null,"answer_key_link":null,"objection_start_date":null,'
+        '"objection_last_date":null,"objection_fee":null,"per_question_fee":null,"objection_mode":null,"objection_address":null,"payment_mode":null,'
+        '"exam_start_date":null,"exam_end_date":null,"timetable_link":null,"subject_list":null,"paper_code":null,"practical_dates":null,"viva_dates":null,'
+        '"revaluation_start_date":null,"revaluation_last_date":null,"revaluation_fee":null,"revaluation_mode":null,'
+        '"certificate_type":null,"processing_time":null,"fee_type":null,"amount":null,"late_fee":null,"payment_link":null,'
+        '"event_type":null,"event_date":null,"event_description":null,"calendar_link":null,"syllabus_link":null,"effective_from":null,'
+        '"scheme_name":null,"scholarship_amount":null,"applicable_category":null,"income_limit":null,"apply_mode":null,"portal_name":null,'
+        '"company_name":null,"job_role":null,"package":null,"location":null,"drive_date":null,'
+        '"tender_no":null,"tender_type":null,"tender_issue_date":null,"work_description":null,"estimated_cost":null,"emd_amount":null,"tender_fee":null,'
+        '"submission_last_date":null,"opening_date":null,"tender_document_link":null,"eligibility_criteria":null,'
+        '"post_name":null,"total_posts":null,"post_details":[],"qualification":null,"age_limit":null,"pay_scale":null,"advertisement_no":null,'
+        '"selection_process":null,"experience_required":null,"posting_location":null,"interview_date":null,"venue":null,'
+        '"subject":null,"notice_type":null,"applicable_to":null,"action_required":null,"action_deadline":null,"effective_date":null,"supersedes":null,"order_link":null,'
+        '"full_content":null,"extra_details":[],"extra_details_present":false'
+        '}]}\n\n'
+        + json.dumps(prompt_items, ensure_ascii=False)
+    )
+
+
+def _normalize_label(label): return re.sub(r"[^\w\s]", "", (label or "").lower()).strip()
+
+
+def _clean_extra_details(raw):
+    if not isinstance(raw, list): return []
+    out = []
+    seen_labels = set()
+    skip_labels = {"qualification", "age", "age limit", "age_limit", "no of post", "no of posts", "number of post", "total post", "total posts", "honorarium", "salary", "pay scale", "pay_scale", "application fee", "application_fee", "last date", "last_date", "start date", "end date", "publish date", "published date"}
+    for item in raw[:15]:
+        if not isinstance(item, dict): continue
+        label = clean_text(str(item.get("label", "")), 100)
+        value = clean_text(str(item.get("value", "")), 300)
+        if not label or not value: continue
+        if _normalize_label(label) in skip_labels: continue
+        key = _normalize_label(label)
+        if key in seen_labels: continue
+        seen_labels.add(key)
+        out.append({"label": label, "value": value})
+    return out
+
+
+def _parse_gemini_response(text, item_count):
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text).strip()
+    parsed = json.loads(text)
+    rows = []
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list): rows = parsed["items"]
+    elif isinstance(parsed, list): rows = parsed
+    def _str(row, key, limit=300):
+        v = row.get(key)
+        if v is None: return None
+        s = clean_text(str(v), limit)
+        return s or None
+    result = {}
+    for row in rows:
+        if not isinstance(row, dict): continue
+        idx = str(row.get("id", ""))
+        if not (idx.isdigit() and 0 <= int(idx) < item_count): continue
+        post_details = row.get("post_details")
+        if not isinstance(post_details, list): post_details = []
+        clean_posts = []
+        for pd in post_details[:15]:
+            if not isinstance(pd, dict): continue
+            clean_posts.append({"post_name": clean_text(str(pd.get("post_name", "")), 120), "category": clean_text(str(pd.get("category", "")), 40), "vacancies": pd.get("vacancies")})
+        result[idx] = {
+            "important": bool(row.get("important", False)), "category": clean_text(str(row.get("category", "notice")), 40) or "notice",
+            "summary": clean_text(str(row.get("summary", "")), 200), "title_hi": _str(row, "title_hi", 200),
+            "reference_number": _str(row, "reference_number", 100), "issuing_authority": _str(row, "issuing_authority", 200), "issuing_date": _str(row, "issuing_date", 80),
+            "contact_person": _str(row, "contact_person", 120), "contact_number": _str(row, "contact_number", 100), "email": _str(row, "email", 150),
+            "helpline_number": _str(row, "helpline_number", 100), "official_address": _str(row, "official_address", 300), "important_instructions": _str(row, "important_instructions", 400),
+            "course_name": _str(row, "course_name", 200), "course_level": _str(row, "course_level", 60), "session": _str(row, "session", 80),
+            "admission_mode": _str(row, "admission_mode", 100), "entrance_exam_name": _str(row, "entrance_exam_name", 200), "eligibility": _str(row, "eligibility", 250),
+            "eligibility_marks": _str(row, "eligibility_marks", 100), "age_criteria": _str(row, "age_criteria", 100), "application_fee": _str(row, "application_fee", 250),
+            "fee_structure": _str(row, "fee_structure", 200), "total_seats": _str(row, "total_seats", 60), "reservation_details": _str(row, "reservation_details", 250),
+            "apply_start_date": _str(row, "apply_start_date", 80), "last_date": _str(row, "last_date", 80), "counselling_date": _str(row, "counselling_date", 80),
+            "apply_link": _str(row, "apply_link", 500), "prospectus_link": _str(row, "prospectus_link", 500), "documents_required": _str(row, "documents_required", 400),
+            "hostel_available": _str(row, "hostel_available", 60), "result_for": _str(row, "result_for", 200), "exam_name": _str(row, "exam_name", 200),
+            "semester": _str(row, "semester", 60), "result_date": _str(row, "result_date", 80), "result_link": _str(row, "result_link", 500),
+            "result_type": _str(row, "result_type", 80), "merit_list_link": _str(row, "merit_list_link", 500), "cutoff_marks": _str(row, "cutoff_marks", 150),
+            "total_selected": _str(row, "total_selected", 60), "next_stage": _str(row, "next_stage", 200), "next_stage_date": _str(row, "next_stage_date", 80),
+            "rechecking_last_date": _str(row, "rechecking_last_date", 80), "rechecking_link": _str(row, "rechecking_link", 500), "rechecking_fee": _str(row, "rechecking_fee", 100),
+            "exam_date": _str(row, "exam_date", 80), "exam_time": _str(row, "exam_time", 60), "exam_duration": _str(row, "exam_duration", 60),
+            "exam_center": _str(row, "exam_center", 250), "reporting_time": _str(row, "reporting_time", 60), "download_start_date": _str(row, "download_start_date", 80),
+            "download_last_date": _str(row, "download_last_date", 80), "admit_card_link": _str(row, "admit_card_link", 500), "instructions": _str(row, "instructions", 400),
+            "total_questions": _str(row, "total_questions", 60), "answer_key_link": _str(row, "answer_key_link", 500), "objection_start_date": _str(row, "objection_start_date", 80),
+            "objection_last_date": _str(row, "objection_last_date", 80), "objection_fee": _str(row, "objection_fee", 100), "per_question_fee": _str(row, "per_question_fee", 100),
+            "objection_mode": _str(row, "objection_mode", 80), "objection_address": _str(row, "objection_address", 250), "payment_mode": _str(row, "payment_mode", 100),
+            "exam_start_date": _str(row, "exam_start_date", 80), "exam_end_date": _str(row, "exam_end_date", 80), "timetable_link": _str(row, "timetable_link", 500),
+            "subject_list": _str(row, "subject_list", 400), "paper_code": _str(row, "paper_code", 200), "practical_dates": _str(row, "practical_dates", 150),
+            "viva_dates": _str(row, "viva_dates", 150), "revaluation_start_date": _str(row, "revaluation_start_date", 80), "revaluation_last_date": _str(row, "revaluation_last_date", 80),
+            "revaluation_fee": _str(row, "revaluation_fee", 100), "revaluation_mode": _str(row, "revaluation_mode", 80), "certificate_type": _str(row, "certificate_type", 120),
+            "processing_time": _str(row, "processing_time", 80), "fee_type": _str(row, "fee_type", 100), "amount": _str(row, "amount", 100),
+            "late_fee": _str(row, "late_fee", 100), "payment_link": _str(row, "payment_link", 500), "event_type": _str(row, "event_type", 100),
+            "event_date": _str(row, "event_date", 80), "event_description": _str(row, "event_description", 250), "calendar_link": _str(row, "calendar_link", 500),
+            "syllabus_link": _str(row, "syllabus_link", 500), "effective_from": _str(row, "effective_from", 80), "scheme_name": _str(row, "scheme_name", 200),
+            "scholarship_amount": _str(row, "scholarship_amount", 150), "applicable_category": _str(row, "applicable_category", 150), "income_limit": _str(row, "income_limit", 100),
+            "apply_mode": _str(row, "apply_mode", 100), "portal_name": _str(row, "portal_name", 150), "company_name": _str(row, "company_name", 200),
+            "job_role": _str(row, "job_role", 200), "package": _str(row, "package", 100), "location": _str(row, "location", 200),
+            "drive_date": _str(row, "drive_date", 80), "tender_no": _str(row, "tender_no", 100), "tender_type": _str(row, "tender_type", 100),
+            "tender_issue_date": _str(row, "tender_issue_date", 80),
+            "work_description": _str(row, "work_description", 300), "estimated_cost": _str(row, "estimated_cost", 100), "emd_amount": _str(row, "emd_amount", 100),
+            "tender_fee": _str(row, "tender_fee", 100), "submission_last_date": _str(row, "submission_last_date", 80), "opening_date": _str(row, "opening_date", 80),
+            "tender_document_link": _str(row, "tender_document_link", 500), "eligibility_criteria": _str(row, "eligibility_criteria", 300), "post_name": _str(row, "post_name", 200),
+            "total_posts": row.get("total_posts"), "post_details": clean_posts, "qualification": _str(row, "qualification", 250),
+            "age_limit": _str(row, "age_limit", 100), "pay_scale": _str(row, "pay_scale", 200), "advertisement_no": _str(row, "advertisement_no", 100),
+            "selection_process": _str(row, "selection_process", 300), "experience_required": _str(row, "experience_required", 200), "posting_location": _str(row, "posting_location", 200),
+            "interview_date": _str(row, "interview_date", 80), "venue": _str(row, "venue", 250), "subject": _str(row, "subject", 200),
+            "notice_type": _str(row, "notice_type", 100), "applicable_to": _str(row, "applicable_to", 200), "action_required": _str(row, "action_required", 250),
+            "action_deadline": _str(row, "action_deadline", 80), "effective_date": _str(row, "effective_date", 80), "supersedes": _str(row, "supersedes", 200),
+            "order_link": _str(row, "order_link", 500), "full_content": _str(row, "full_content", 500),
+            "extra_details": _clean_extra_details(row.get("extra_details")), "extra_details_present": bool(row.get("extra_details_present", False)),
+        }
+    if not result: raise RuntimeError("Gemini returned no usable classifications")
+    return result
+
+
+def _extract_gemini_text(data):
+    candidates = None
+    if isinstance(data, dict): candidates = data.get("candidates")
+    elif isinstance(data, list): candidates = data
+    if not isinstance(candidates, list) or not candidates: raise RuntimeError("Gemini returned no candidates")
+    first = candidates[0]
+    part_lists = []
+    if isinstance(first, dict):
+        content = first.get("content")
+        if isinstance(content, dict):
+            raw_parts = content.get("parts")
+            if isinstance(raw_parts, list): part_lists.append(raw_parts)
+        elif isinstance(content, list): part_lists.append(content)
+    elif isinstance(first, list): part_lists.append(first)
+    texts = []
+    for parts in part_lists:
+        for part in parts:
+            if isinstance(part, dict):
+                t = part.get("text")
+                if isinstance(t, str) and t.strip(): texts.append(t)
+    return "".join(texts).strip()
+
+
+def gemini_classify(items, api_key, model, timeout):
+    if not items: return {}
+    prompt_items = [{"id": str(i), "title": item["title"], "url": item["url"], "context": item.get("context", "")[:500], "pdf_text": item.get("pdf_text", "")[:3000]} for i, item in enumerate(items)]
+    prompt = _build_prompt(prompt_items)
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS, "temperature": 0.1}}
+    last_error = "Gemini classification failed"
+    for attempt in range(3):
+        try:
+            response, key_used, reason = _gemini_post_with_rotation(endpoint, payload, timeout=timeout)
+            if response is None:
+                if reason == "all_keys_quota_exhausted": raise RuntimeError("All Gemini keys quota-exhausted")
+                raise RuntimeError(f"Gemini keys unavailable: {reason}")
+            if response.status_code in (500, 502, 503, 504):
+                last_error = f"Gemini HTTP {response.status_code}"
+                if attempt < 2:
+                    time.sleep(min(10, 2 ** attempt))
+                    continue
+                raise RuntimeError(last_error)
+            if response.status_code == 404:
+                _DEAD_MODELS.add(model)
+                raise RuntimeError(f"Gemini model unavailable: {model}")
+            if response.status_code >= 400: raise RuntimeError(f"Gemini HTTP {response.status_code}: {clean_text(response.text, 500)}")
+            data = response.json()
+            response_text = _extract_gemini_text(data)
+            if not response_text: raise RuntimeError("Gemini returned empty response")
+            return _parse_gemini_response(response_text, len(items))
+        except (requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            last_error = str(exc)
+            if attempt < 2: time.sleep(min(10, 2 ** attempt))
+    raise RuntimeError(last_error)
+
+
+def gemini_classify_with_fallback(items, api_key, timeout):
+    global _GEMINI_QUOTA_EXHAUSTED
+    if _GEMINI_QUOTA_EXHAUSTED or not _has_live_gemini_keys():
+        print("[GEMINI] No usable Gemini keys; using keyword fallback.", file=sys.stderr)
+        return keyword_fallback(items)
+    seen = []
+    for model in _DYNAMIC_MODELS:
+        if model in seen or model in _DEAD_MODELS: continue
+        seen.append(model)
+        try:
+            result = gemini_classify(items, api_key, model, timeout)
+            if result:
+                print(f"[INFO] Gemini classify success: {model}")
+                return result
+        except Exception as exc:
+            err_str = str(exc)
+            if "all gemini keys quota-exhausted" in err_str.lower():
+                _GEMINI_QUOTA_EXHAUSTED = True
+                print("[QUOTA] All Gemini keys quota-exhausted; using keyword fallback.", file=sys.stderr)
+                break
+            print(f"[WARN] Classify {model} failed: {clean_text(err_str, 200)}", file=sys.stderr)
+            continue
+    print("[WARN] Gemini classification unavailable. Using keyword fallback.", file=sys.stderr)
+    return keyword_fallback(items)
+
+
+def telegram_request(method, token, payload, timeout=20): return requests.post(f"https://api.telegram.org/bot{token}/{method}", json=payload, timeout=timeout)
+
+
+def validate_telegram_token(token):
+    response = telegram_request("getMe", token, {}, timeout=15)
+    if not response.ok: raise RuntimeError(f"Telegram bot token invalid: HTTP {response.status_code}: {clean_text(response.text, 300)}")
+
+
+def send_telegram(token, chat_id, text):
+    for attempt in range(3):
+        try:
+            response = telegram_request("sendMessage", token, {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False})
+            if response.ok: return (True, False, "sent")
+            try:
+                data = response.json()
+                description = clean_text(str(data.get("description", response.text)), 400)
+                retry_after = int((data.get("parameters") or {}).get("retry_after", 0) or 0)
+            except Exception:
+                description = clean_text(response.text, 400)
+                retry_after = 0
+            if response.status_code in (400, 401, 403, 404): return (False, True, f"Telegram HTTP {response.status_code}: {description}")
+            if response.status_code == 429 and attempt < 2:
+                time.sleep(min(max(retry_after + 1, 2), 60))
+                continue
+            if response.status_code >= 500 and attempt < 2:
+                time.sleep(min(10, 2 ** attempt))
+                continue
+            return (False, False, f"Telegram HTTP {response.status_code}: {description}")
+        except requests.RequestException as exc:
+            if attempt < 2:
+                time.sleep(min(10, 2 ** attempt))
+                continue
+            return (False, False, f"Telegram network error: {exc}")
+    return (False, False, "Telegram send failed")
+
+
+def send_telegram_document(token, chat_id, pdf_bytes, filename, caption=""):
+    for attempt in range(3):
+        try:
+            files = {"document": (filename, pdf_bytes, "application/pdf")}
+            data = {"chat_id": chat_id, "caption": caption[:TELEGRAM_CAPTION_LIMIT], "parse_mode": "HTML"}
+            response = requests.post(f"https://api.telegram.org/bot{token}/sendDocument", data=data, files=files, timeout=60)
+            if response.ok: return (True, False, "sent")
+            try:
+                rdata = response.json()
+                description = clean_text(str(rdata.get("description", response.text)), 400)
+                retry_after = int((rdata.get("parameters") or {}).get("retry_after", 0) or 0)
+            except Exception:
+                description = clean_text(response.text, 400)
+                retry_after = 0
+            if response.status_code in (400, 401, 403, 404): return (False, True, f"Telegram HTTP {response.status_code}: {description}")
+            if response.status_code == 429 and attempt < 2:
+                time.sleep(min(max(retry_after + 1, 2), 60))
+                continue
+            if response.status_code >= 500 and attempt < 2:
+                time.sleep(min(10, 2 ** attempt))
+                continue
+            return (False, False, f"Telegram HTTP {response.status_code}: {description}")
+        except requests.RequestException as exc:
+            if attempt < 2:
+                time.sleep(min(10, 2 ** attempt))
+                continue
+            return (False, False, f"Telegram network error: {exc}")
+    return (False, False, "Telegram send document failed")
+
+
+def _safe_filename(url, default="notice.pdf"):
+    try:
+        parsed = urlparse(url)
+        from urllib.parse import parse_qs
+        query_values = parse_qs(parsed.query)
+        for key in ("file", "filename", "name", "doc"):
+            for candidate in query_values.get(key, []):
+                candidate = unquote(str(candidate)).replace("\\\\", "/").rsplit("/", 1)[-1]
+                if candidate.lower().endswith(".pdf"):
+                    cleaned = re.sub(r"[^\w\u0900-\u097F\-.]", "_", candidate)
+                    if cleaned.strip("._-"):
+                        return cleaned[:100]
+        name = parsed.path.rsplit("/", 1)[-1]
+        if name and name.lower().endswith(".pdf"):
+            cleaned = unquote(name)
+            cleaned = re.sub(r"[^\w\u0900-\u097F\-.]", "_", cleaned)
+            return cleaned[:100]
+        path = unquote(parsed.path or "").rstrip("/")
+        slug = path.rsplit("/", 1)[-1]
+        slug = re.sub(r"^(notice|document|page|post)[-_/]", "", slug, flags=re.I)
+        slug = re.sub(r"[^\w\u0900-\u097F\-]", "_", slug)
+        slug = re.sub(r"_+", "_", slug).strip("_")
+        if slug and len(slug) >= 5: return f"{slug[:80]}.pdf"
+    except Exception: pass
+    return default
+
+
+def _build_pdf_caption(full_message, classification):
+    if not classification: return truncate_telegram(full_message, TELEGRAM_CAPTION_LIMIT)
+    priority_keys = [("last_date", "Last Date"), ("submission_last_date", "Submission Last"), ("application_start_date", "App Starts"), ("apply_start_date", "App Starts"), ("exam_date", "Exam Date"), ("result_date", "Result Date"), ("total_posts", "Total Posts"), ("application_fee", "Fee"), ("pay_scale", "Pay")]
+    parts = []
+    for k, label in priority_keys:
+        v = classification.get(k)
+        if v: parts.append(f"• {label}: {v}")
+    priority_block = ""
+    if parts: priority_block = "\n\n━━━\n" + "\n".join(parts[:6])
+    available = TELEGRAM_CAPTION_LIMIT - len(priority_block)
+    if available > 200:
+        caption = truncate_telegram(full_message, available)
+        return caption.rstrip() + priority_block
+    return truncate_telegram(full_message, TELEGRAM_CAPTION_LIMIT)
+
+
+def send_notification_with_pdf(token, chat_id, record, full_message):
+    pdf_url = record.get("url", "")
+    filename = _safe_filename(pdf_url)
+    pdf_bytes = _cache_get(pdf_url)
+    if pdf_bytes is None:
+        try:
+            session = make_session()
+            try:
+                content, actual_url, method = _download_with_pdf_resolution(session, pdf_url, 30, verify_ssl=_SITE_VERIFY_SSL_BY_ID.get(record.get("site_id"), True))
+            finally:
+                session.close()
+            if content and len(content) <= MAX_PDF_SEND_BYTES:
+                pdf_bytes = content
+                _cache_put(pdf_url, content)
+                if actual_url and actual_url != pdf_url:
+                    _cache_put(actual_url, content)
+                    new_name = _safe_filename(actual_url)
+                    if new_name and new_name != "notice.pdf": filename = new_name
+        except Exception as exc: print(f"[WARN] PDF download for send failed: {exc}", file=sys.stderr)
+    if not pdf_bytes: return send_telegram(token, chat_id, truncate_telegram(full_message))
+    caption = _build_pdf_caption(full_message, record.get("classification"))
+    if len(caption) > TELEGRAM_CAPTION_LIMIT:
+        caption = caption[:TELEGRAM_CAPTION_LIMIT]
+        last_nl = caption.rfind("\n")
+        if last_nl > TELEGRAM_CAPTION_LIMIT * 0.7: caption = caption[:last_nl]
+        caption = caption.rstrip()
+    return send_telegram_document(token, chat_id, pdf_bytes, filename, caption=caption)
+
+
+
+def _safe_image_filename(url):
+    try:
+        name = unquote(urlparse(str(url or "")).path.rsplit("/", 1)[-1])
+        if name and re.search(r"\.(?:jpe?g|png|webp|gif)$", name, re.I):
+            return re.sub(r"[^\w\-.]", "_", name)[:100]
+    except Exception:
+        pass
+    return "notice.jpg"
+
+
+def send_notification_with_image(token, chat_id, record, full_message):
+    image_url = str(record.get("url", "") or "")
+    image_bytes = _cache_get(image_url)
+    if image_bytes is None:
+        session = None
+        try:
+            session = make_session()
+            response = session.get(
+                image_url, timeout=_SITE_TIMEOUT_BY_ID.get(record.get("site_id"), 30),
+                stream=True, verify=_SITE_VERIFY_SSL_BY_ID.get(record.get("site_id"), True),
+            )
+            try:
+                if response.status_code != 200:
+                    return send_telegram(token, chat_id, truncate_telegram(full_message))
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                chunks, total = [], 0
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk: continue
+                    total += len(chunk)
+                    if total > 10 * 1024 * 1024:
+                        return send_telegram(token, chat_id, truncate_telegram(full_message))
+                    chunks.append(chunk)
+                image_bytes = b"".join(chunks)
+                if not image_bytes or ("image/" not in content_type and not image_bytes.startswith(
+                    (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF8", b"RIFF")
+                )):
+                    return send_telegram(token, chat_id, truncate_telegram(full_message))
+                _cache_put(image_url, image_bytes)
+            finally:
+                response.close()
+        except Exception as exc:
+            print(f"[WARN] Image download for send failed: {exc}", file=sys.stderr)
+            return send_telegram(token, chat_id, truncate_telegram(full_message))
+        finally:
+            if session is not None:
+                try: session.close()
+                except Exception: pass
+
+    caption = _build_pdf_caption(full_message, record.get("classification"))
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption[:TELEGRAM_CAPTION_LIMIT], "parse_mode": "HTML"},
+            files={"photo": (
+                _safe_image_filename(image_url), image_bytes,
+                mimetypes.guess_type(_safe_image_filename(image_url))[0] or "image/jpeg"
+            )},
+            timeout=60,
+        )
+        if response.ok: return (True, False, "sent")
+        try:
+            data = response.json()
+            description = clean_text(str(data.get("description", response.text)), 400)
+        except Exception:
+            description = clean_text(response.text, 400)
+        if response.status_code in (400, 401, 403, 404):
+            return (False, True, f"Telegram HTTP {response.status_code}: {description}")
+        return (False, False, f"Telegram HTTP {response.status_code}: {description}")
+    except requests.RequestException as exc:
+        return (False, False, f"Telegram photo network error: {exc}")
+
+
+CATEGORY_EMOJI = {"admission": "🎓", "result": "📊", "admit_card": "🎫", "answer_key": "🔑", "exam_schedule": "📅", "revaluation": "🔄", "migration_certificate": "📜", "fee_structure": "💳", "academic_calendar": "🗓️", "syllabus": "📚", "timetable": "⏰", "scholarship": "🎯", "placement": "💼", "tender": "📑", "vacancy": "💼", "notice": "📌", "other": "📎"}
+
+
+def _safe_str(value, limit=300):
+    if value is None: return None
+    text = clean_text(str(value), limit)
+    return text or None
+
+
+def _is_devanagari(s):
+    if not s: return False
+    dev_count = sum(1 for c in s if "\u0900" <= c <= "\u097F")
+    return dev_count > len(s) * 0.3
+
+
+_LABELS_HI = {
+    "reference_number": "संदर्भ संख्या", "issuing_authority": "जारीकर्ता प्राधिकरण", "issuing_date": "जारी तारीख़", "contact_person": "संपर्क व्यक्ति", "contact_number": "संपर्क नंबर", "email": "ईमेल", "helpline_number": "हेल्पलाइन नंबर", "official_address": "कार्यालय पता", "important_instructions": "ज़रूरी निर्देश", "course_name": "कोर्स", "course_level": "कोर्स स्तर", "session": "सत्र", "admission_mode": "प्रवेश मोड", "entrance_exam_name": "प्रवेश परीक्षा", "eligibility": "योग्यता", "eligibility_marks": "योग्यता मार्क्स", "age_criteria": "उम्र मानदंड", "application_fee": "आवेदन शुल्क", "fee_structure": "शुल्क संरचना", "total_seats": "कुल सीटें", "reservation_details": "आरक्षण विवरण", "apply_start_date": "आवेदन शुरू", "last_date": "अंतिम तिथि", "counselling_date": "काउंसलिंग तिथि", "apply_link": "ऑनलाइन आवेदन", "prospectus_link": "प्रॉस्पेक्टस", "documents_required": "आवश्यक दस्तावेज़", "hostel_available": "हॉस्टल उपलब्ध", "result_for": "परिणाम किसका", "exam_name": "परीक्षा", "semester": "सेमेस्टर", "result_date": "परिणाम तिथि", "result_link": "परिणाम देखें", "result_type": "परिणाम प्रकार", "merit_list_link": "मेरिट लिस्ट", "cutoff_marks": "कटऑफ़ मार्क्स", "total_selected": "कुल चयनित", "next_stage": "अगला चरण", "next_stage_date": "अगले चरण की तिथि", "rechecking_last_date": "रीचेकिंग अंतिम तिथि", "rechecking_link": "रीचेकिंग लिंक", "rechecking_fee": "रीचेकिंग शुल्क", "exam_date": "परीक्षा तिथि", "exam_time": "परीक्षा समय", "exam_duration": "परीक्षा अवधि", "exam_center": "परीक्षा केंद्र", "reporting_time": "रिपोर्टिंग समय", "download_start_date": "डाउनलोड शुरू", "download_last_date": "डाउनलोड अंतिम", "admit_card_link": "एडमिट कार्ड डाउनलोड", "instructions": "निर्देश", "total_questions": "कुल प्रश्न", "answer_key_link": "उत्तर कुंजी देखें", "objection_start_date": "आपत्ति शुरू", "objection_last_date": "आपत्ति अंतिम", "objection_fee": "आपत्ति शुल्क", "per_question_fee": "प्रति प्रश्न शुल्क", "objection_mode": "आपत्ति मोड", "objection_address": "आपत्ति पता", "payment_mode": "भुगतान मोड", "exam_start_date": "परीक्षा शुरू", "exam_end_date": "परीक्षा समाप्त", "timetable_link": "टाइम टेबल देखें", "subject_list": "विषय सूची", "paper_code": "पेपर कोड", "practical_dates": "प्रैक्टिकल तिथियाँ", "viva_dates": "वाइवा तिथियाँ", "revaluation_start_date": "पुनर्मूल्यांकन शुरू", "revaluation_last_date": "पुनर्मूल्यांकन अंतिम", "revaluation_fee": "पुनर्मूल्यांकन शुल्क", "revaluation_mode": "पुनर्मूल्यांकन मोड", "certificate_type": "प्रमाण पत्र प्रकार", "processing_time": "प्रोसेसिंग समय", "fee_type": "शुल्क प्रकार", "amount": "राशि", "late_fee": "विलंब शुल्क", "payment_link": "भुगतान लिंक", "event_type": "कार्यक्रम प्रकार", "event_date": "कार्यक्रम तिथि", "event_description": "विवरण", "calendar_link": "कैलेंडर देखें", "syllabus_link": "पाठ्यक्रम देखें", "effective_from": "प्रभावी तिथि से", "scheme_name": "योजना", "scholarship_amount": "छात्रवृत्ति राशि", "applicable_category": "किस श्रेणी के लिए", "income_limit": "आय सीमा", "apply_mode": "आवेदन मोड", "portal_name": "पोर्टल", "company_name": "कंपनी", "job_role": "जॉब रोल", "package": "पैकेज", "location": "स्थान", "drive_date": "ड्राइव तिथि", "tender_no": "निविदा संख्या", "tender_type": "निविदा प्रकार", "work_description": "कार्य विवरण", "estimated_cost": "अनुमानित लागत", "emd_amount": "EMD राशि", "tender_fee": "निविदा शुल्क", "submission_last_date": "जमा अंतिम तिथि", "opening_date": "खोलने की तिथि", "tender_document_link": "निविदा दस्तावेज़", "eligibility_criteria": "पात्रता मानदंड", "post_name": "पद का नाम", "total_posts": "कुल पद", "post_breakdown": "पद विवरण", "qualification": "योग्यता", "age_limit": "उम्र सीमा", "pay_scale": "वेतन", "advertisement_no": "विज्ञापन संख्या", "selection_process": "चयन प्रक्रिया", "experience_required": "अनुभव आवश्यक", "posting_location": "पोस्टिंग स्थान", "interview_date": "इंटरव्यू तिथि", "venue": "स्थान", "subject": "विषय", "notice_type": "सूचना प्रकार", "applicable_to": "किस पर लागू", "action_required": "क्या करना है", "action_deadline": "अंतिम तिथि", "effective_date": "प्रभावी तिथि", "supersedes": "किसे रद्द करता है", "order_link": "आदेश देखें", "full_content": "पूरा विवरण", "other_details": "अन्य जानकारी", "read_full": "पूरी सूचना देखें",
+    "tender_issue_date": "निविदा जारी तिथि",
+    "tender_submission_last_date": "निविदा जमा अंतिम तिथि",
+    "tender_opening_date": "निविदा खोलने की तिथि",
+}
+_LABELS_EN = {
+    "reference_number": "Reference No", "issuing_authority": "Issuing Authority", "issuing_date": "Issuing Date", "contact_person": "Contact Person", "contact_number": "Contact Number", "email": "Email", "helpline_number": "Helpline", "official_address": "Official Address", "important_instructions": "Important Instructions", "course_name": "Course", "course_level": "Course Level", "session": "Session", "admission_mode": "Admission Mode", "entrance_exam_name": "Entrance Exam", "eligibility": "Eligibility", "eligibility_marks": "Eligibility Marks", "age_criteria": "Age Criteria", "application_fee": "Application Fee", "fee_structure": "Fee Structure", "total_seats": "Total Seats", "reservation_details": "Reservation Details", "apply_start_date": "Application Starts", "last_date": "Last Date", "counselling_date": "Counselling Date", "apply_link": "Apply Online", "prospectus_link": "Prospectus", "documents_required": "Documents Required", "hostel_available": "Hostel Available", "result_for": "Result For", "exam_name": "Exam", "semester": "Semester", "result_date": "Result Date", "result_link": "Check Result", "result_type": "Result Type", "merit_list_link": "Merit List", "cutoff_marks": "Cutoff Marks", "total_selected": "Total Selected", "next_stage": "Next Stage", "next_stage_date": "Next Stage Date", "rechecking_last_date": "Rechecking Last Date", "rechecking_link": "Rechecking Link", "rechecking_fee": "Rechecking Fee", "exam_date": "Exam Date", "exam_time": "Exam Time", "exam_duration": "Exam Duration", "exam_center": "Exam Center", "reporting_time": "Reporting Time", "download_start_date": "Download Starts", "download_last_date": "Download Last Date", "admit_card_link": "Download Admit Card", "instructions": "Instructions", "total_questions": "Total Questions", "answer_key_link": "View Answer Key", "objection_start_date": "Objection Starts", "objection_last_date": "Objection Last Date", "objection_fee": "Objection Fee", "per_question_fee": "Per Question Fee", "objection_mode": "Objection Mode", "objection_address": "Objection Address", "payment_mode": "Payment Mode", "exam_start_date": "Exam Starts", "exam_end_date": "Exam Ends", "timetable_link": "Timetable", "subject_list": "Subjects", "paper_code": "Paper Code", "practical_dates": "Practical Dates", "viva_dates": "Viva Dates", "revaluation_start_date": "Revaluation Starts", "revaluation_last_date": "Revaluation Last Date", "revaluation_fee": "Revaluation Fee", "revaluation_mode": "Revaluation Mode", "certificate_type": "Certificate Type", "processing_time": "Processing Time", "fee_type": "Fee Type", "amount": "Amount", "late_fee": "Late Fee", "payment_link": "Payment Link", "event_type": "Event Type", "event_date": "Event Date", "event_description": "Description", "calendar_link": "View Calendar", "syllabus_link": "View Syllabus", "effective_from": "Effective From", "scheme_name": "Scheme", "scholarship_amount": "Scholarship Amount", "applicable_category": "Applicable Category", "income_limit": "Income Limit", "apply_mode": "Application Mode", "portal_name": "Portal", "company_name": "Company", "job_role": "Job Role", "package": "Package", "location": "Location", "drive_date": "Drive Date", "tender_no": "Tender No", "tender_type": "Tender Type", "work_description": "Work Description", "estimated_cost": "Estimated Cost", "emd_amount": "EMD", "tender_fee": "Tender Fee", "submission_last_date": "Submission Last Date", "opening_date": "Opening Date", "tender_document_link": "Tender Document", "eligibility_criteria": "Eligibility", "post_name": "Post Name", "total_posts": "Total Posts", "post_breakdown": "Post-wise Breakdown", "qualification": "Qualification", "age_limit": "Age Limit", "pay_scale": "Pay Scale", "advertisement_no": "Advertisement No", "selection_process": "Selection Process", "experience_required": "Experience Required", "posting_location": "Posting Location", "interview_date": "Interview Date", "venue": "Venue", "subject": "Subject", "notice_type": "Notice Type", "applicable_to": "Applicable To", "action_required": "Action Required", "action_deadline": "Action Deadline", "effective_date": "Effective Date", "supersedes": "Supersedes", "order_link": "View Order", "full_content": "Full Content", "other_details": "Other Details", "read_full": "View Full Notice",
+    "tender_issue_date": "Tender Issue Date",
+    "tender_submission_last_date": "Tender Submission Last Date",
+    "tender_opening_date": "Tender Opening Date",
+}
+_CATEGORY_NAMES_HI = {"admission": "प्रवेश", "result": "परिणाम", "admit_card": "प्रवेश पत्र", "answer_key": "उत्तर कुंजी", "exam_schedule": "परीक्षा कार्यक्रम", "revaluation": "पुनर्मूल्यांकन", "migration_certificate": "माइग्रेशन / प्रमाण पत्र", "fee_structure": "शुल्क संरचना", "academic_calendar": "शैक्षणिक कैलेंडर", "syllabus": "पाठ्यक्रम", "timetable": "समय सारिणी", "scholarship": "छात्रवृत्ति", "placement": "प्लेसमेंट", "tender": "निविदा", "vacancy": "भर्ती", "notice": "सूचना", "other": "अन्य"}
+_CATEGORY_NAMES_EN = {"admission": "Admission", "result": "Result", "admit_card": "Admit Card", "answer_key": "Answer Key", "exam_schedule": "Exam Schedule", "revaluation": "Revaluation", "migration_certificate": "Migration / Certificate", "fee_structure": "Fee Structure", "academic_calendar": "Academic Calendar", "syllabus": "Syllabus", "timetable": "Timetable", "scholarship": "Scholarship", "placement": "Placement", "tender": "Tender", "vacancy": "Vacancy", "notice": "Notice", "other": "Other"}
+_DISCLAIMER_HI = "⚠️ एक बार ऑफिशियल नोटिफिकेशन ज़रूर पढ़ें — सभी डिटेल्स खुद कन्फर्म कर लें।"
+_DISCLAIMER_EN = "⚠️ Please read the official notification once to confirm all details."
+
+
+def _labels(key):
+    if NOTIFY_LANGUAGE == "hi": return _LABELS_HI.get(key, _LABELS_EN.get(key, key))
+    if NOTIFY_LANGUAGE == "en": return _LABELS_EN.get(key, key)
+    hi = _LABELS_HI.get(key, key)
+    en = _LABELS_EN.get(key, key)
+    if hi == en: return hi
+    return f"{hi} / {en}"
+
+
+def _category_name(category):
+    if NOTIFY_LANGUAGE == "hi": return _CATEGORY_NAMES_HI.get(category, category)
+    if NOTIFY_LANGUAGE == "en": return _CATEGORY_NAMES_EN.get(category, category)
+    hi = _CATEGORY_NAMES_HI.get(category, category)
+    en = _CATEGORY_NAMES_EN.get(category, category)
+    if hi == en: return hi
+    return f"{hi} / {en}"
+
+
+def _disclaimer_block():
+    lines = ["", "━━━━━━━━━━━━━━━"]
+    if NOTIFY_LANGUAGE in ("hi", "both"): lines.append(f"<i>{html.escape(_DISCLAIMER_HI)}</i>")
+    if NOTIFY_LANGUAGE in ("en", "both"): lines.append(f"<i>{html.escape(_DISCLAIMER_EN)}</i>")
+    return lines
+
+
+def _line(lines, emoji, label, value):
+    if value: lines.append(f"{emoji} <b>{_labels(label)}:</b> {html.escape(str(value))}")
+
+
+def _link_line(lines, emoji, label, url):
+    if url: lines.append(f'{emoji} <a href="{html.escape(url, quote=True)}">{html.escape(_labels(label))}</a>')
+
+
+def _format_extra_details(lines, c):
+    details = c.get("extra_details") or []
+    if not details: return
+    lines.append("")
+    lines.append(f"📋 <b>{_labels('other_details')}:</b>")
+    for d in details[:10]:
+        label = _safe_str(d.get("label"), 100)
+        value = _safe_str(d.get("value"), 300)
+        if label and value: lines.append(f"   • <b>{html.escape(label)}:</b> {html.escape(value)}")
+
+
+def _format_admission(lines, c):
+    _line(lines, "🎓", "course_name", _safe_str(c.get("course_name"))); _line(lines, "📊", "course_level", _safe_str(c.get("course_level"))); _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "📋", "admission_mode", _safe_str(c.get("admission_mode"))); _line(lines, "📝", "entrance_exam_name", _safe_str(c.get("entrance_exam_name"))); _line(lines, "📊", "total_seats", _safe_str(c.get("total_seats"))); _line(lines, "✅", "eligibility", _safe_str(c.get("eligibility"))); _line(lines, "📋", "eligibility_marks", _safe_str(c.get("eligibility_marks"))); _line(lines, "🎂", "age_criteria", _safe_str(c.get("age_criteria"))); _line(lines, "💳", "application_fee", _safe_str(c.get("application_fee"))); _line(lines, "💰", "fee_structure", _safe_str(c.get("fee_structure"))); _line(lines, "📋", "reservation_details", _safe_str(c.get("reservation_details"))); _line(lines, "📋", "hostel_available", _safe_str(c.get("hostel_available"))); _line(lines, "📋", "documents_required", _safe_str(c.get("documents_required"))); _line(lines, "📅", "apply_start_date", _safe_str(c.get("apply_start_date"))); _line(lines, "📅", "last_date", _safe_str(c.get("last_date"))); _line(lines, "🎯", "counselling_date", _safe_str(c.get("counselling_date"))); _link_line(lines, "📄", "prospectus_link", _safe_str(c.get("prospectus_link"), 500)); _link_line(lines, "🌐", "apply_link", _safe_str(c.get("apply_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_result(lines, c):
+    _line(lines, "📝", "result_for", _safe_str(c.get("result_for"))); _line(lines, "📝", "exam_name", _safe_str(c.get("exam_name"))); _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "📚", "semester", _safe_str(c.get("semester"))); _line(lines, "📋", "result_type", _safe_str(c.get("result_type"))); _line(lines, "📅", "result_date", _safe_str(c.get("result_date"))); _line(lines, "📊", "total_selected", _safe_str(c.get("total_selected"))); _line(lines, "📋", "cutoff_marks", _safe_str(c.get("cutoff_marks"))); _link_line(lines, "📄", "result_link", _safe_str(c.get("result_link"), 500)); _link_line(lines, "📄", "merit_list_link", _safe_str(c.get("merit_list_link"), 500)); _line(lines, "📋", "next_stage", _safe_str(c.get("next_stage"))); _line(lines, "📅", "next_stage_date", _safe_str(c.get("next_stage_date"))); _line(lines, "🔄", "rechecking_last_date", _safe_str(c.get("rechecking_last_date"))); _line(lines, "💳", "rechecking_fee", _safe_str(c.get("rechecking_fee"))); _link_line(lines, "🔗", "rechecking_link", _safe_str(c.get("rechecking_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_admit_card(lines, c):
+    _line(lines, "📝", "exam_name", _safe_str(c.get("exam_name"))); _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "📚", "semester", _safe_str(c.get("semester"))); _line(lines, "📅", "exam_date", _safe_str(c.get("exam_date"))); _line(lines, "⏰", "exam_time", _safe_str(c.get("exam_time"))); _line(lines, "⏱️", "exam_duration", _safe_str(c.get("exam_duration"))); _line(lines, "📍", "exam_center", _safe_str(c.get("exam_center"))); _line(lines, "⏰", "reporting_time", _safe_str(c.get("reporting_time"))); _line(lines, "⬇️", "download_start_date", _safe_str(c.get("download_start_date"))); _line(lines, "📅", "download_last_date", _safe_str(c.get("download_last_date"))); _line(lines, "📋", "instructions", _safe_str(c.get("instructions"))); _line(lines, "📞", "helpline_number", _safe_str(c.get("helpline_number"))); _link_line(lines, "🎫", "admit_card_link", _safe_str(c.get("admit_card_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_answer_key(lines, c):
+    _line(lines, "📝", "exam_name", _safe_str(c.get("exam_name"))); _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "📅", "exam_date", _safe_str(c.get("exam_date"))); _line(lines, "📋", "total_questions", _safe_str(c.get("total_questions"))); _link_line(lines, "🔑", "answer_key_link", _safe_str(c.get("answer_key_link"), 500)); _line(lines, "📅", "objection_start_date", _safe_str(c.get("objection_start_date"))); _line(lines, "📅", "objection_last_date", _safe_str(c.get("objection_last_date"))); _line(lines, "💳", "objection_fee", _safe_str(c.get("objection_fee"))); _line(lines, "💳", "per_question_fee", _safe_str(c.get("per_question_fee"))); _line(lines, "📋", "objection_mode", _safe_str(c.get("objection_mode"))); _line(lines, "💳", "payment_mode", _safe_str(c.get("payment_mode"))); _line(lines, "📍", "objection_address", _safe_str(c.get("objection_address"))); _format_extra_details(lines, c)
+
+
+def _format_exam_schedule(lines, c):
+    _line(lines, "📝", "exam_name", _safe_str(c.get("exam_name"))); _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "📚", "semester", _safe_str(c.get("semester"))); _line(lines, "🎓", "course_name", _safe_str(c.get("course_name"))); _line(lines, "📅", "exam_start_date", _safe_str(c.get("exam_start_date"))); _line(lines, "📅", "exam_end_date", _safe_str(c.get("exam_end_date"))); _line(lines, "⏰", "exam_time", _safe_str(c.get("exam_time"))); _line(lines, "📍", "exam_center", _safe_str(c.get("exam_center"))); _line(lines, "📋", "subject_list", _safe_str(c.get("subject_list"))); _line(lines, "📋", "paper_code", _safe_str(c.get("paper_code"))); _line(lines, "📅", "practical_dates", _safe_str(c.get("practical_dates"))); _line(lines, "📅", "viva_dates", _safe_str(c.get("viva_dates"))); _link_line(lines, "📄", "timetable_link", _safe_str(c.get("timetable_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_revaluation(lines, c):
+    _line(lines, "📝", "exam_name", _safe_str(c.get("exam_name"))); _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "📚", "semester", _safe_str(c.get("semester"))); _line(lines, "🎓", "course_name", _safe_str(c.get("course_name"))); _line(lines, "📅", "revaluation_start_date", _safe_str(c.get("revaluation_start_date"))); _line(lines, "📅", "revaluation_last_date", _safe_str(c.get("revaluation_last_date"))); _line(lines, "💳", "revaluation_fee", _safe_str(c.get("revaluation_fee"))); _line(lines, "📋", "revaluation_mode", _safe_str(c.get("revaluation_mode"))); _line(lines, "📋", "instructions", _safe_str(c.get("instructions"))); _link_line(lines, "🌐", "apply_link", _safe_str(c.get("apply_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_migration_certificate(lines, c):
+    _line(lines, "📜", "certificate_type", _safe_str(c.get("certificate_type"))); _line(lines, "📋", "applicable_to", _safe_str(c.get("applicable_to"))); _line(lines, "💳", "application_fee", _safe_str(c.get("application_fee"))); _line(lines, "⏱️", "processing_time", _safe_str(c.get("processing_time"))); _line(lines, "📋", "documents_required", _safe_str(c.get("documents_required"))); _line(lines, "📋", "instructions", _safe_str(c.get("instructions"))); _line(lines, "📞", "contact_number", _safe_str(c.get("contact_number"))); _link_line(lines, "🌐", "apply_link", _safe_str(c.get("apply_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_fee_structure(lines, c):
+    _line(lines, "🎓", "course_name", _safe_str(c.get("course_name"))); _line(lines, "📊", "course_level", _safe_str(c.get("course_level"))); _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "💳", "fee_type", _safe_str(c.get("fee_type"))); _line(lines, "💰", "amount", _safe_str(c.get("amount"))); _line(lines, "💳", "late_fee", _safe_str(c.get("late_fee"))); _line(lines, "📅", "last_date", _safe_str(c.get("last_date"))); _line(lines, "📋", "payment_mode", _safe_str(c.get("payment_mode"))); _line(lines, "📋", "instructions", _safe_str(c.get("instructions"))); _link_line(lines, "🌐", "payment_link", _safe_str(c.get("payment_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_academic_calendar(lines, c):
+    _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "📋", "event_type", _safe_str(c.get("event_type"))); _line(lines, "📅", "event_date", _safe_str(c.get("event_date"))); _line(lines, "📝", "event_description", _safe_str(c.get("event_description"))); _line(lines, "👥", "applicable_to", _safe_str(c.get("applicable_to"))); _link_line(lines, "📄", "calendar_link", _safe_str(c.get("calendar_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_syllabus(lines, c):
+    _line(lines, "🎓", "course_name", _safe_str(c.get("course_name"))); _line(lines, "📊", "course_level", _safe_str(c.get("course_level"))); _line(lines, "📚", "semester", _safe_str(c.get("semester"))); _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "📅", "effective_from", _safe_str(c.get("effective_from"))); _line(lines, "📋", "subject_list", _safe_str(c.get("subject_list"))); _link_line(lines, "📄", "syllabus_link", _safe_str(c.get("syllabus_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_timetable(lines, c):
+    _line(lines, "📝", "exam_name", _safe_str(c.get("exam_name"))); _line(lines, "📅", "session", _safe_str(c.get("session"))); _line(lines, "📚", "semester", _safe_str(c.get("semester"))); _line(lines, "🎓", "course_name", _safe_str(c.get("course_name"))); _line(lines, "📅", "exam_start_date", _safe_str(c.get("exam_start_date"))); _line(lines, "📅", "exam_end_date", _safe_str(c.get("exam_end_date"))); _line(lines, "📋", "subject_list", _safe_str(c.get("subject_list"))); _link_line(lines, "📄", "timetable_link", _safe_str(c.get("timetable_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_scholarship(lines, c):
+    _line(lines, "🎯", "scheme_name", _safe_str(c.get("scheme_name"))); _line(lines, "💰", "scholarship_amount", _safe_str(c.get("scholarship_amount"))); _line(lines, "👥", "applicable_category", _safe_str(c.get("applicable_category"))); _line(lines, "💵", "income_limit", _safe_str(c.get("income_limit"))); _line(lines, "🎓", "eligibility", _safe_str(c.get("eligibility"))); _line(lines, "📋", "documents_required", _safe_str(c.get("documents_required"))); _line(lines, "📋", "apply_mode", _safe_str(c.get("apply_mode"))); _line(lines, "📋", "portal_name", _safe_str(c.get("portal_name"))); _line(lines, "📅", "last_date", _safe_str(c.get("last_date"))); _line(lines, "📞", "helpline_number", _safe_str(c.get("helpline_number"))); _link_line(lines, "🌐", "apply_link", _safe_str(c.get("apply_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_placement(lines, c):
+    _line(lines, "🏢", "company_name", _safe_str(c.get("company_name"))); _line(lines, "💼", "job_role", _safe_str(c.get("job_role"))); _line(lines, "💰", "package", _safe_str(c.get("package"))); _line(lines, "📍", "location", _safe_str(c.get("location"))); _line(lines, "📅", "drive_date", _safe_str(c.get("drive_date"))); _line(lines, "🎓", "eligibility", _safe_str(c.get("eligibility"))); _line(lines, "📋", "documents_required", _safe_str(c.get("documents_required"))); _line(lines, "📅", "last_date", _safe_str(c.get("last_date"))); _link_line(lines, "🌐", "apply_link", _safe_str(c.get("apply_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_tender(lines, c):
+    tender_issue = _safe_str(c.get("tender_issue_date")) or _safe_str(c.get("issuing_date"))
+    _line(lines, "📅", "tender_issue_date", tender_issue)
+    _line(lines, "📋", "tender_no", _safe_str(c.get("tender_no")))
+    _line(lines, "📋", "tender_type", _safe_str(c.get("tender_type")))
+    _line(lines, "📝", "work_description", _safe_str(c.get("work_description")))
+    _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority")))
+    _line(lines, "💰", "estimated_cost", _safe_str(c.get("estimated_cost")))
+    _line(lines, "💳", "emd_amount", _safe_str(c.get("emd_amount")))
+    _line(lines, "📄", "tender_fee", _safe_str(c.get("tender_fee")))
+    _line(lines, "📅", "tender_submission_last_date", _safe_str(c.get("tender_submission_last_date")))
+    _line(lines, "📅", "submission_last_date", _safe_str(c.get("submission_last_date")))
+    _line(lines, "📅", "tender_opening_date", _safe_str(c.get("tender_opening_date")))
+    _line(lines, "📅", "opening_date", _safe_str(c.get("opening_date")))
+    _line(lines, "📋", "eligibility_criteria", _safe_str(c.get("eligibility_criteria")))
+    _link_line(lines, "📄", "tender_document_link", _safe_str(c.get("tender_document_link"), 500))
+    _format_extra_details(lines, c)
+
+def _format_vacancy(lines, c):
+    total = c.get("total_posts")
+    if total: lines.append(f"📊 <b>{_labels('total_posts')}:</b> {html.escape(str(total))}")
+    pd_list = c.get("post_details") or []
+    if pd_list:
+        lines.append(f"📋 <b>{_labels('post_breakdown')}:</b>")
+        for pd in pd_list[:10]:
+            pname = html.escape(_safe_str(pd.get("post_name"), 120) or "Post")
+            cat = html.escape(_safe_str(pd.get("category"), 40) or "-")
+            vac = pd.get("vacancies")
+            vac_str = f" — {vac}" if vac is not None else ""
+            lines.append(f"   • {pname} ({cat}){vac_str}")
+    _line(lines, "📋", "advertisement_no", _safe_str(c.get("advertisement_no"))); _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority"))); _line(lines, "🎓", "qualification", _safe_str(c.get("qualification"))); _line(lines, "🎂", "age_limit", _safe_str(c.get("age_limit"))); _line(lines, "💰", "pay_scale", _safe_str(c.get("pay_scale"))); _line(lines, "📋", "experience_required", _safe_str(c.get("experience_required"))); _line(lines, "📋", "posting_location", _safe_str(c.get("posting_location"))); _line(lines, "📋", "selection_process", _safe_str(c.get("selection_process"))); _line(lines, "📅", "last_date", _safe_str(c.get("last_date"))); _line(lines, "📅", "interview_date", _safe_str(c.get("interview_date"))); _line(lines, "📍", "venue", _safe_str(c.get("venue"))); _line(lines, "📞", "contact_number", _safe_str(c.get("contact_number"))); _link_line(lines, "🌐", "apply_link", _safe_str(c.get("apply_link"), 500)); _format_extra_details(lines, c)
+
+
+def _format_notice(lines, c):
+    _line(lines, "📝", "subject", _safe_str(c.get("subject"))); _line(lines, "📋", "notice_type", _safe_str(c.get("notice_type"))); _line(lines, "🔖", "reference_number", _safe_str(c.get("reference_number"))); _line(lines, "🏢", "issuing_authority", _safe_str(c.get("issuing_authority"))); _line(lines, "👥", "applicable_to", _safe_str(c.get("applicable_to"))); _line(lines, "📋", "action_required", _safe_str(c.get("action_required"))); _line(lines, "📅", "action_deadline", _safe_str(c.get("action_deadline"))); _line(lines, "📋", "supersedes", _safe_str(c.get("supersedes"))); _line(lines, "📅", "effective_date", _safe_str(c.get("effective_date"))); _line(lines, "📋", "important_instructions", _safe_str(c.get("important_instructions"))); _link_line(lines, "🔗", "order_link", _safe_str(c.get("order_link"), 500)); _format_extra_details(lines, c)
+
+
+_FORMATTERS = {"admission": _format_admission, "result": _format_result, "admit_card": _format_admit_card, "answer_key": _format_answer_key, "exam_schedule": _format_exam_schedule, "revaluation": _format_revaluation, "migration_certificate": _format_migration_certificate, "fee_structure": _format_fee_structure, "academic_calendar": _format_academic_calendar, "syllabus": _format_syllabus, "timetable": _format_timetable, "scholarship": _format_scholarship, "placement": _format_placement, "tender": _format_tender, "vacancy": _format_vacancy, "notice": _format_notice}
+
+
+def format_message(site, item, classification=None):
+    classification = classification or {}
+    raw_title = _resolve_title(item)
+    title_hi = _safe_str(classification.get("title_hi"), 200)
+    title_is_hindi = _is_devanagari(raw_title)
+    site_name = html.escape(site["name"])
+    site_tag = "#" + site["id"].replace("-", "_").upper()
+    url = html.escape(item["url"], quote=True)
+    summary_raw = _safe_str(classification.get("summary")) or ""
+    if summary_raw.strip().lower() == raw_title.strip().lower(): summary_raw = ""
+    summary = html.escape(summary_raw)
+    category = (classification.get("category") or "notice").lower()
+    emoji = CATEGORY_EMOJI.get(category, "📌")
+    ocr_method = item.get("pdf_method", "")
+    if ocr_method == "gemini": ocr_marker = " 🔍G"
+    elif str(ocr_method).startswith("rapidocr"): ocr_marker = " 🔍R"
+    elif str(ocr_method).startswith("tesseract"): ocr_marker = " 🔍T"
+    elif ocr_method == "cache": ocr_marker = " 🔍C"
+    else: ocr_marker = ""
+    pdf_marker = " 📄" if item.get("is_pdf") else ""
+    lines = [f"🔔 <b>{site_name}</b> {site_tag}{pdf_marker}", ""]
+    lines.append(f"<b>{html.escape(raw_title)}</b>{ocr_marker}")
+    if not title_is_hindi and title_hi and title_hi.strip().lower() != raw_title.strip().lower():
+        if NOTIFY_LANGUAGE in ("both", "hi"): lines.append(f"<i>{html.escape(title_hi)}</i>")
+    lines.append("")
+    if summary:
+        lines.append(summary)
+        lines.append("")
+    try:
+        formatter = _FORMATTERS.get(category)
+        if formatter: formatter(lines, classification)
+    except Exception as exc: print(f"[WARN] Message formatting error: {exc}", file=sys.stderr)
+    lines.append("")
+    lines.append(f"{emoji} <b>{html.escape(_category_name(category))}</b>")
+    lines.append(f'🔗 <a href="{url}">{html.escape(_labels("read_full"))}</a>')
+    lines.extend(_disclaimer_block())
+    return "\n".join(lines)
+
+
+def truncate_telegram(text, limit=TELEGRAM_SAFE_LIMIT):
+    text = str(text or "")
+    if len(text) <= limit: return text
+    marker = "\n\n<i>…(truncated)</i>"
+    safe_limit = max(0, limit - len(marker))
+    truncated = text[:safe_limit]
+    last_nl = truncated.rfind("\n")
+    if last_nl > 0:
+        truncated = truncated[:last_nl]
+    else:
+        truncated = truncated.rstrip("<>\"'=&")
+    return truncated.rstrip() + marker
+
+
+def prune_state(state, retention_days, max_items=3000, max_pending_attempts=72, max_bytes=3000000, sent_retention_days=90, ignored_retention_days=30, baseline_retention_days=60, max_sent_fingerprints=12000, max_html_fingerprints=8000):
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=retention_days)
+    items = state.setdefault("items", {})
+    remove = []
+    terminal = {"sent", "ignored", "permanent_error", "baseline"}
+    for key, record in list(items.items()):
+        if not isinstance(record, dict):
+            remove.append(key)
+            continue
+        status = record.get("status", "baseline")
+        loaded_status = record.pop("_loaded_status", None)
+        if status == "pending" and int(record.get("attempts", 0) or 0) >= max_pending_attempts:
+            record["status"] = "permanent_error"
+            record["last_error"] = clean_text("Retry limit reached; last error: " + str(record.get("last_error") or "unknown"), 500)
+            status = "permanent_error"
+        telegram_attempts = int(record.get("telegram_attempts", 0) or 0)
+        telegram_first_failed = _parse_utc_timestamp(record.get("telegram_first_failed_at"))
+        telegram_window_expired = bool(telegram_first_failed and (now - telegram_first_failed).total_seconds() > TELEGRAM_RETRY_WINDOW_HOURS * 3600)
+        if status == "ready" and (telegram_attempts >= TELEGRAM_MAX_ATTEMPTS or telegram_window_expired):
+            record["status"] = "permanent_error"
+            record["last_error"] = clean_text("Telegram retry window/attempt limit reached; last error: " + str(record.get("last_error") or "unknown"), 500)
+            status = "permanent_error"
+        if status in terminal:
+            status_days = {"sent": max(7, int(sent_retention_days)), "ignored": max(7, int(ignored_retention_days)), "baseline": max(7, int(baseline_retention_days)), "permanent_error": retention_days}.get(status, retention_days)
+            status_cutoff = now - timedelta(days=status_days)
+            if not record.get("terminal_at"):
+                if loaded_status and loaded_status not in terminal: record["terminal_at"] = now.isoformat()
+                else: record["terminal_at"] = record.get("first_seen") or record.get("last_seen") or now.isoformat()
+            record.pop("pdf_text", None); record.pop("classification", None); record.pop("summary", None); record.pop("pdf_extracted", None); record.pop("pdf_method", None); record.pop("ocr_used", None); record.pop("pdf_summary_hint", None)
+            if record.get("context"): record["context"] = clean_text(record.get("context"), 300)
+            stamp = record.get("terminal_at")
+            try:
+                dt = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+            except Exception: dt = now
+            if dt < status_cutoff: remove.append(key)
+        else: record.pop("terminal_at", None)
+    for key in remove: items.pop(key, None)
+    review = state.setdefault("review_queue", {})
+    review_cutoff = now - timedelta(days=90)
+    for key, entry in list(review.items()):
+        stamp = _parse_utc_timestamp(entry.get("updated_at") or entry.get("first_seen")) if isinstance(entry, dict) else None
+        if not isinstance(entry, dict) or (stamp and stamp < review_cutoff and entry.get("status") != "open"): review.pop(key, None)
+    if len(review) > 500:
+        ordered = sorted(review.items(), key=lambda kv: str((kv[1] or {}).get("updated_at", "")))
+        for key, _ in ordered[:len(review) - 500]:
+            if review.get(key, {}).get("status") != "open": review.pop(key, None)
+    open_items = [(k, v) for k, v in review.items()
+                  if isinstance(v, dict) and v.get("status") == "open"]
+    if len(open_items) > 300:
+        ordered_open = sorted(open_items, key=lambda kv: str(
+            kv[1].get("first_seen") or kv[1].get("updated_at") or ""
+        ))
+        for key, _ in ordered_open[:len(open_items) - 300]:
+            review.pop(key, None)
+    if len(items) > max_items:
+        terminal_rows = []
+        active_rows = []
+        for key, record in items.items():
+            stamp = record.get("terminal_at") or record.get("last_seen") or record.get("first_seen") or ""
+            row = (str(stamp), key)
+            if record.get("status") in terminal: terminal_rows.append(row)
+            else: active_rows.append(row)
+        terminal_rows.sort()
+        while len(items) > max_items and terminal_rows:
+            _, key = terminal_rows.pop(0)
+            items.pop(key, None)
+        if len(items) > max_items:
+            active_rows.sort(reverse=True)
+            keep = {key for _, key in active_rows[:max_items - len(items) + len(active_rows)]}
+            for _, key in active_rows:
+                if len(items) <= max_items: break
+                if key in items and key not in keep: items.pop(key, None)
+            if len(items) > max_items:
+                for _, key in sorted(active_rows):
+                    if len(items) <= max_items: break
+                    items.pop(key, None)
+    # Compact indexes are pruned independently from state.items. Their own caps
+    # prevent max_state_items from silently shortening deduplication history.
+    fingerprint_cutoff = now - timedelta(days=max(7, int(sent_retention_days)))
+    fingerprints = state.setdefault("sent_fingerprints", {})
+    for key, entry in list(fingerprints.items()):
+        if not isinstance(entry, dict):
+            fingerprints.pop(key, None)
+            continue
+        stamp = _parse_utc_timestamp(entry.get("d"))
+        if stamp and stamp < fingerprint_cutoff:
+            fingerprints.pop(key, None)
+    sent_cap = max(1000, int(max_sent_fingerprints))
+    if len(fingerprints) > sent_cap:
+        ordered = sorted(fingerprints.items(), key=lambda kv: str((kv[1] or {}).get("d", "")))
+        for key, _ in ordered[:len(fingerprints) - sent_cap]:
+            fingerprints.pop(key, None)
+
+    html_fingerprints = state.setdefault("html_fingerprints", {})
+    for key, entry in list(html_fingerprints.items()):
+        if not isinstance(entry, dict):
+            html_fingerprints.pop(key, None)
+            continue
+        stamp = _parse_utc_timestamp(entry.get("d"))
+        if stamp and stamp < fingerprint_cutoff:
+            html_fingerprints.pop(key, None)
+    html_cap = max(1000, int(max_html_fingerprints))
+    if len(html_fingerprints) > html_cap:
+        ordered = sorted(html_fingerprints.items(), key=lambda kv: str((kv[1] or {}).get("d", "")))
+        for key, _ in ordered[:len(html_fingerprints) - html_cap]:
+            html_fingerprints.pop(key, None)
+
+    def serialized_size():
+        try:
+            payload = json.dumps(state, ensure_ascii=False, indent=2, separators=(",", ": ")) + "\n"
+            return len(payload.encode("utf-8"))
+        except (TypeError, ValueError): return max_bytes + 1
+    for record in items.values():
+        if not isinstance(record, dict): continue
+        for field, limit in (("title", 300), ("context", 700), ("summary", 500), ("last_error", 500), ("pdf_text", MAX_PDF_TEXT_CHARS), ("explicit_title", 300)):
+            value = record.get(field)
+            if isinstance(value, str) and len(value) > limit: record[field] = clean_text(value, limit)
+        if record.get("status") in {"pending", "ready"} and isinstance(record.get("pdf_text"), str):
+            if len(record["pdf_text"]) > 2000: record["pdf_text"] = clean_text(record["pdf_text"], 2000)
+        classification = record.get("classification")
+        if isinstance(classification, dict):
+            compact = {}
+            for key, value in classification.items():
+                if value is None or value == "" or value == []: continue
+                if key == "post_details" and isinstance(value, list): compact[key] = value[:8]
+                elif key == "extra_details" and isinstance(value, list): compact[key] = value[:8]
+                elif isinstance(value, str): compact[key] = clean_text(value, 500)
+                else: compact[key] = value
+            compact.setdefault("important", bool(classification.get("important", False)))
+            compact.setdefault("category", classification.get("category", "notice"))
+            record["classification"] = compact
+    if serialized_size() > max_bytes:
+        terminal_rows = []
+        for key, record in items.items():
+            if isinstance(record, dict) and record.get("status") in terminal:
+                stamp = record.get("terminal_at") or record.get("first_seen") or record.get("last_seen") or ""
+                terminal_rows.append((str(stamp), key))
+        terminal_rows.sort()
+        for _, key in terminal_rows:
+            items.pop(key, None)
+            if serialized_size() <= max_bytes: break
+    if serialized_size() > max_bytes:
+        for record in items.values():
+            if not isinstance(record, dict): continue
+            status = record.get("status")
+            if status == "ready" and record.get("classification"): record.pop("pdf_text", None)
+            elif status in {"pending", "ready"} and isinstance(record.get("pdf_text"), str): record["pdf_text"] = clean_text(record["pdf_text"], 2000)
+            if isinstance(record.get("context"), str): record["context"] = clean_text(record.get("context"), 350)
+    final_size = serialized_size()
+    if final_size > max_bytes: raise RuntimeError(f"State exceeds configured byte cap: {final_size} > {max_bytes}")
+    print(f"[STATE] bounded state size={final_size} bytes (limit={max_bytes})")
+
+
+def refresh_stats(state):
+    counts = {"sent": 0, "ignored": 0, "pending": 0}
+    for record in state.get("items", {}).values():
+        status = record.get("status")
+        if status in counts: counts[status] += 1
+    state["stats"]["pending"] = counts["pending"]
+    state["stats"]["ignored"] = counts["ignored"]
+    state["stats"]["sent"] = counts["sent"]
+
+
+_RIMS_NOTICE_PATHS = (
+    "/class_file/pdf/",
+    "/odwbrms/",
+    "/public/storage/cms/notice/",
+    "/storage/notice",
+    "/writereaddata/",
+    "/uploadfile/",
+)
+
+
+def _is_rims_notice_pdf(url):
+    u = str(url or "").lower()
+    return "rimsranchi.ac.in" in u and any(p in u for p in _RIMS_NOTICE_PATHS)
+
+
+def _is_non_notice_pdf(record):
+    url_lower = (record.get("url") or "").lower()
+    if not (url_lower.endswith(".pdf") or ".pdf" in url_lower): return False
+    if _is_rims_notice_pdf(url_lower):
+        return False
+    combined = " ".join((record.get("explicit_title") or "", record.get("title") or "")).lower()
+    return not any(kw in combined for kw in _NOTICE_KEYWORDS)
+
+
+def _attachment_priority(record):
+    """Global queue priority: PDF attachments first, direct images second, HTML-only last.
+
+    HTML pages are still fetched and parsed during discovery. This priority only
+    controls which discovered pending records receive the limited processing
+    budget first; it does not skip HTML discovery or notice-link extraction.
+    """
+    url = str(record.get("url", "") or "")
+    path = urlparse(url).path.casefold()
+    is_image = bool(record.get("is_image")) or path.endswith((".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp", ".gif"))
+    is_pdf = bool(record.get("is_pdf")) or _looks_like_pdf_url(url) or path.endswith(".pdf")
+    if is_pdf:
+        return 2
+    if is_image:
+        return 1
+    return 0
+
+
+def _should_fetch_pdf(record):
+    if record.get("pdf_extracted") or record.get("pdf_text"): return False
+    if int(record.get("pdf_attempts", 0)) >= MAX_PDF_ATTEMPTS: return False
+    url = record.get("url", "")
+    url_lower = url.lower()
+    # Never send direct image URLs through the PDF parser/Gemini PDF path.
+    image_path = urlparse(url).path.lower()
+    if record.get("is_image") or image_path.endswith((".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")):
+        return False
+    try:
+        parsed = urlparse(url)
+        if parsed.path in ("", "/"): return False
+    except Exception: pass
+    if url_lower.endswith(".pdf") or ".pdf" in url_lower:
+        title_lower = " ".join((record.get("explicit_title") or "", record.get("title") or "")).lower()
+        if not any(kw in title_lower for kw in _NOTICE_KEYWORDS):
+            if not _is_rims_notice_pdf(url_lower):
+                print(f"[SKIP-PDF] Non-notice PDF (faculty/other): {title_lower[:60]}", file=sys.stderr)
+                return False
+    block_patterns = ("/past-notices", "/past_notices", "/whats-new", "/whats_new", "/notice_category", "/notice-category", "/document-category", "/document_category", "/archive", "/search", "/contact-us", "/contact_us", "/contactus", "/about-district", "/about_district", "/photo-gallery", "/photo_gallery", "/video-gallery", "/video_gallery", "/anti-ragging", "/grievance", "/rti")
+    if any(pat in url_lower for pat in block_patterns): return False
+    if any(hint in url_lower for hint in ("/downloadfile", "/download_file", "/downloadpdf", "/download_pdf", "/getfile", "/showfile", "/viewfile", "/filedownload", "/writereaddata/", "/uploadfile/", "/storage/notices/", "/storage/notice/", "/documents/notice", "/notice-documents/")): return True
+    if record.get("is_pdf", False): return True
+    return False
+
+
+def _extract_image_text_rapidocr(image_bytes):
+    """OCR a direct JPG/PNG notice image with RapidOCR; never invokes PaddleOCR."""
+    if not OCR_ENABLED or not _RAPIDOCR_AVAILABLE or not image_bytes:
+        return ""
+    ocr = _get_rapidocr()
+    if ocr is None:
+        return ""
+    try:
+        result, _elapsed = ocr(image_bytes)
+        if not result:
+            return ""
+        lines = [str(row[1]).strip() for row in result if isinstance(row, (list, tuple)) and len(row) > 1 and str(row[1]).strip()]
+        text = "\n".join(lines)
+        return "" if _text_looks_garbage(text) else text
+    except Exception as exc:
+        print(f"[WARN] RapidOCR image failed safely: {exc}", file=sys.stderr)
+        return ""
+
+
+def _extract_image_text_tesseract(image_bytes):
+    """Fallback OCR for direct image notices using installed Tesseract."""
+    if not TESSERACT_ENABLED or not _TESSERACT_AVAILABLE or not image_bytes:
+        return ""
+    try:
+        config = f"--psm {TESSERACT_PSM}" if TESSERACT_PSM else ""
+        with _PIL_Image.open(io.BytesIO(image_bytes)) as img:
+            img.load()
+            text = pytesseract.image_to_string(img.convert("RGB"), lang=TESSERACT_LANG, config=config)
+        text = (text or "").strip()
+        return "" if _text_looks_garbage(text) else text
+    except Exception as exc:
+        print(f"[WARN] Tesseract image failed safely: {exc}", file=sys.stderr)
+        return ""
+
+
+def _fetch_images_for_batch(batch, scan, send_deadline=None):
+    """Fetch and OCR direct image notice candidates; OCR failure never aborts the run."""
+    targets = [(iid, record) for iid, record in batch
+               if record.get("is_image") and not record.get("pdf_text")
+               and int(record.get("pdf_attempts", 0)) < MAX_PDF_ATTEMPTS]
+    if not targets:
+        return
+    default_timeout = scan["request_timeout_seconds"]
+    for iid, record in targets:
+        if send_deadline and time.monotonic() > send_deadline:
+            print("[TIME_LIMIT] Image OCR deferred to next run", file=sys.stderr)
+            break
+        record["pdf_attempts"] = int(record.get("pdf_attempts", 0)) + 1
+        image_session = None
+        try:
+            timeout = _SITE_TIMEOUT_BY_ID.get(record.get("site_id"), default_timeout)
+            image_session = make_session()
+            response = image_session.get(record.get("url", ""), timeout=timeout, stream=True,
+                                          verify=_SITE_VERIFY_SSL_BY_ID.get(record.get("site_id"), True))
+            try:
+                if response.status_code != 200:
+                    record["pdf_method"] = f"image_http_{response.status_code}"
+                    _set_failure_diagnostic(record, "image_download", f"image_download:{record['pdf_method']}", record["pdf_method"])
+                    print(f"[WARN] Image download HTTP {response.status_code}: {record.get('url','')[:100]}", file=sys.stderr)
+                    continue
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                chunks, total = [], 0
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > 12 * 1024 * 1024:
+                        chunks = []
+                        break
+                    chunks.append(chunk)
+                image_bytes = b"".join(chunks)
+                if not image_bytes or total > 12 * 1024 * 1024:
+                    record["pdf_method"] = "image_size_limit"
+                    _set_failure_diagnostic(record, "image_download", "image_download:image_size_limit", record["pdf_method"])
+                    continue
+                if "image/" not in content_type and not image_bytes.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF8", b"RIFF")):
+                    record["pdf_method"] = "not_image"
+                    _set_failure_diagnostic(record, "image_download", "image_download:not_image_content", record["pdf_method"])
+                    continue
+                _cache_put(record.get("url", ""), image_bytes)
+            finally:
+                response.close()
+                image_session.close()
+            text = _extract_image_text_rapidocr(image_bytes)
+            method = "rapidocr_image" if text else ""
+            if not text:
+                print("[OCR] RapidOCR image produced no usable text; trying Tesseract...", file=sys.stderr)
+                text = _extract_image_text_tesseract(image_bytes)
+                if text:
+                    method = "tesseract_image"
+            if text:
+                record["pdf_text"] = clean_text(text, MAX_PDF_TEXT_CHARS)
+                record["pdf_extracted"] = True
+                record["ocr_used"] = True
+                record["pdf_method"] = method
+                record.pop("last_failure_stage", None); record.pop("last_failure_reason", None); record.pop("last_failure_category", None)
+                print(f"[INFO] {method} succeeded ({len(text)} chars): {record.get('url','')[:80]}", file=sys.stderr)
+            else:
+                record["pdf_method"] = "image_ocr_no_text"
+                _set_failure_diagnostic(record, "image_ocr", "pdf_extract_empty:image_ocr_no_text", record["pdf_method"])
+                print(f"[WARN] No usable text extracted from image: {record.get('url','')[:100]}", file=sys.stderr)
+        except Exception as exc:
+            record["pdf_method"] = "image_ocr_error"
+            _set_failure_diagnostic(record, "image_ocr", f"image_ocr_error:{type(exc).__name__}:{exc}", record["pdf_method"])
+            print(f"[WARN] Image OCR skipped safely: {exc}", file=sys.stderr)
+        finally:
+            if image_session is not None:
+                try: image_session.close()
+                except Exception: pass
+
+
+def _fetch_pdfs_for_batch(batch, scan, state, send_deadline=None):
+    targets = [(iid, record) for iid, record in batch if _should_fetch_pdf(record)]
+    if not targets: return
+    default_timeout = scan["request_timeout_seconds"]
+    def _fetch_one(record):
+        if send_deadline and time.monotonic() > send_deadline: return None, "", False, "time_limit", ""
+        try:
+            timeout = _SITE_TIMEOUT_BY_ID.get(record.get("site_id"), default_timeout)
+            return download_pdf_content(record["url"], timeout, verify_ssl=_SITE_VERIFY_SSL_BY_ID.get(record.get("site_id"), True), deadline=send_deadline)
+        except Exception as exc:
+            print(f"[WARN] PDF fetch error: {exc}", file=sys.stderr)
+            return None, "", False, "error", ""
+    workers = max(1, min(OCR_MAX_WORKERS, len(targets)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_fetch_one, record): (iid, record) for iid, record in targets}
+        for fut in as_completed(futures):
+            iid, record = futures[fut]
+            try:
+                result_tuple = fut.result()
+                content, text, ocr_used, method = result_tuple[:4]
+                raw_pdf_text = result_tuple[4] if len(result_tuple) > 4 else ""
+            except Exception: content, text, ocr_used, method, raw_pdf_text = None, "", False, "error", ""
+            record["pdf_attempts"] = int(record.get("pdf_attempts", 0)) + 1
+            record["pdf_method"] = method
+            text_len = len(text) if text else 0
+            print(f"[PDF-RESULT] site_id={record.get('site_id','unknown')} url={str(record.get('url',''))[:120]} attempt={record['pdf_attempts']}/{MAX_PDF_ATTEMPTS} method={method or 'unknown'} text_chars={text_len} title={str(record.get('title',''))[:60]!r}", file=sys.stderr)
+            if not content:
+                _set_failure_diagnostic(record, "pdf_download", f"pdf_download:{method or 'no_content'}", method)
+            elif not text or len(str(text).strip()) < 20:
+                _set_failure_diagnostic(record, "pdf_extraction", f"pdf_extract_empty:{method or 'unknown'}", method)
+            else:
+                record.pop("last_failure_stage", None)
+                record.pop("last_failure_reason", None)
+                record.pop("last_failure_category", None)
+            if content:
+                try:
+                    new_hash = _pdf_content_fingerprint(content)
+                    new_kind = new_hash.split(":", 1)[0]
+                    old_hash = record.get("pdf_hash")
+                    old_kind = record.get("pdf_hash_kind")
+                    if old_hash and old_kind == new_kind and old_hash != new_hash:
+                        print(f"[PDF-CHANGED] PDF rendered content changed: {record.get('url', '')[:100]}", file=sys.stderr)
+                        record["classification"] = None
+                        record["summary"] = ""
+                    record["pdf_hash"] = new_hash
+                    record["pdf_hash_kind"] = new_kind
+                except Exception as exc: print(f"[WARN] PDF hash failed: {exc}", file=sys.stderr)
+            if text:
+                record["pdf_text"] = text[:MAX_PDF_TEXT_CHARS]
+                record["pdf_extracted"] = True
+                record["ocr_used"] = bool(ocr_used)
+                try:
+                    _bt, pdf_summary = _extract_pdf_title_and_summary(raw_pdf_text or text, record.get("title", ""))
+                    if pdf_summary and not record.get("pdf_summary_hint"): record["pdf_summary_hint"] = pdf_summary
+                except Exception as exc: print(f"[WARN] PDF summary extraction failed: {exc}", file=sys.stderr)
+                effective_title = record.get("explicit_title") or record.get("title", "")
+                # strict_pdf_date=True: PDF content date/session overrides HTML upload_date
+                if _is_stale_notice(effective_title, record.get("context", ""), record.get("url", ""), upload_date=_parse_upload_date(record.get("upload_date")), pdf_text=text, strict_pdf_date=True):
+                    record["status"] = "baseline"
+                    record["classification"] = None
+                    record["summary"] = ""
+                    record["last_error"] = f"PDF content stale (limit={STALE_NOTICE_DAYS}d or old year)"
+                    print(f"[STALE-PDF] Suppressed old PDF notice: {record.get('url','')[:80]}", file=sys.stderr)
+                    continue
+                if _needs_undated_old_batch_review(effective_title, text):
+                    record["status"] = "pending"
+                    record["classification"] = None
+                    record["summary"] = ""
+                    record["last_error"] = "Date review required: readable PDF has old batch/session year but no credible issue date"
+                    add_review_item(state, record, "undated_old_batch_requires_review")
+                    print(
+                        f"[DATE-REVIEW-HOLD] Not auto-sent: old batch/session and no credible PDF issue date: "
+                        f"{str(effective_title)[:90]}",
+                        file=sys.stderr
+                    )
+                    continue
+
+
+def _parse_upload_date(raw):
+    if not raw: return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception: return None
+
+
+def suppress_stale_pending_and_ready(state):
+    changed = 0
+    for record in state.get("items", {}).values():
+        if not isinstance(record, dict) or record.get("status") not in {"pending", "ready"}:
+            continue
+        effective_title = record.get("explicit_title") or record.get("title", "")
+        pdf_text = record.get("pdf_text", "")
+        strict_pdf = bool(record.get("pdf_extracted") and pdf_text)
+
+        stale = _is_stale_notice(
+            effective_title,
+            record.get("context", ""),
+            record.get("url", ""),
+            upload_date=_parse_upload_date(record.get("upload_date")),
+            pdf_text=pdf_text,
+            strict_pdf_date=strict_pdf,
+        )
+
+        # Defence-in-depth: exact date first, year fallback only if no date found
+        if not stale and strict_pdf:
+            expired, kind, ev = _is_expired_by_date_or_year(pdf_text)
+            if expired:
+                stale = True
+                print(
+                    f"[PERSISTED-YEAR-FALLBACK] kind={kind} evidence={ev} "
+                    f"title={effective_title[:70]}",
+                    file=sys.stderr,
+                )
+
+        if stale:
+            record["status"] = "baseline"
+            record["classification"] = None
+            record["summary"] = ""
+            record["last_error"] = f"Stale persisted item suppressed (limit={STALE_NOTICE_DAYS}d or old year)"
+            changed += 1
+
+    if changed:
+        print(f"[STALE-SKIP] Suppressed {changed} stale persisted item(s)", file=sys.stderr)
+    return changed
+
+# Per-category expiry rules:
+#   "min"  → earliest cutoff (apply/submit window) — first cutoff बीता = expired
+#   "max"  → latest event date — कोई भी event future में है = valid
+#   None   → evergreen (कोई hard expiry नहीं)
+#
+# Only primary_fields से expiry तय होती है।
+# informational dates (issue_date, download_start_date, effective_date) formatter में
+# दिखते हैं पर expiry check में नहीं आते।
+_EXPIRY_RULES = {
+    "admission":             ("min", ("last_date", "counselling_date")),
+    "result":                ("max", ("rechecking_last_date", "next_stage_date", "result_date")),
+    "admit_card":            ("max", ("exam_date", "download_last_date")),
+    "answer_key":            ("min", ("objection_last_date",)),
+    "exam_schedule":         ("max", ("exam_end_date", "exam_start_date")),
+    "revaluation":           ("min", ("revaluation_last_date", "rechecking_last_date")),
+    "migration_certificate": ("min", ("action_deadline", "last_date")),
+    "fee_structure":         ("min", ("last_date", "fee_last_date")),
+    "academic_calendar":     ("max", ("event_date", "effective_from")),
+    "syllabus":              (None, ()),
+    "timetable":             ("max", ("exam_end_date", "exam_start_date")),
+    "scholarship":           ("min", ("last_date",)),
+    "placement":             ("min", ("last_date", "drive_date", "interview_date")),
+    "tender":                ("min", ("tender_submission_last_date", "submission_last_date")),
+    "vacancy":               ("min", ("last_date", "interview_date")),
+    "notice":                ("min", ("action_deadline", "effective_date")),
+    "other":                 (None, ()),
+}
+
+
+def _pre_send_expired_check(record, now=None):
+    """Final pre-Telegram expired-deadline gate.
+    Step 1: category-specific structured deadline fields (exact date priority).
+    Step 2: pdf_text fallback (exact date → year fallback).
+    Returns (expired: bool, reason: str)."""
+    now = now or datetime.now(timezone.utc)
+    today = now.date()
+    cls = record.get("classification") or {}
+    cat = (cls.get("category") or "notice").lower()
+    rule, fields = _EXPIRY_RULES.get(cat, (None, ()))
+
+    if rule is not None and fields:
+        observed = []
+        for key in fields:
+            value = cls.get(key)
+            if not value:
+                continue
+            parsed = _extract_document_dates(str(value))
+            if parsed:
+                observed.append((key, max(parsed)))
+        if observed:
+            if rule == "max":
+                key, latest = max(observed, key=lambda kv: kv[1])
+            else:  # min
+                key, latest = min(observed, key=lambda kv: kv[1])
+            if latest.date() < today:
+                return True, f"expired_{cat}_{key}={latest.date().isoformat()}"
+            return False, f"active_{cat}_{key}={latest.date().isoformat()}"
+
+    pdf_text = record.get("pdf_text") or ""
+    if pdf_text.strip():
+        expired, kind, evidence = _is_expired_by_date_or_year(pdf_text, now=now)
+        if expired:
+            return True, f"expired_pdf_{kind}={evidence}"
+
+    return False, "no_explicit_deadline"
+
+def enqueue_persisted_pending(state, pending, max_pending_attempts, configured_site_ids):
+    by_id = {iid: record for iid, record in pending}
+    for iid, record in state.get("items", {}).items():
+        if not isinstance(record, dict) or record.get("status") != "pending": continue
+        sid = record.get("site_id")
+        if sid not in configured_site_ids: continue
+        if not site_state(state, sid).get("baseline_complete", False): continue
+        if int(record.get("attempts", 0) or 0) >= max_pending_attempts: continue
+        by_id[iid] = record
+    return list(by_id.items())
+
+
+def run_self_tests():
+    """Offline regression checks; never scans websites or sends Telegram messages."""
+    checks = 0
+    def check(condition, message):
+        nonlocal checks
+        if not condition:
+            raise AssertionError(message)
+        checks += 1
+
+    first_hash = _html_content_hash("Exam Form Notice", "visitor count 100", "https://example.edu/notice?id=4&utm_source=first")
+    second_hash = _html_content_hash(" Exam   Form Notice ", "visitor count 900", "https://example.edu/notice?utm_medium=second&id=4")
+    check(bool(first_hash) and first_hash == second_hash, "HTML identity changed due to context/tracking parameters")
+    check(not _meaningful_metadata_change("Exam Form Notice", "Exam Form Notice", "visitor count 100; sidebar updated", "visitor count 900; sidebar refreshed"), "Dynamic context triggered reprocessing")
+    check(_meaningful_metadata_change("Exam Form Notice", "Exam Form Notice", "Last date: 10 October 2026", "Last date: 20 October 2026"), "Meaningful deadline change was not detected")
+
+    state = default_state()
+    sent_record = {"title":"Exam Form Notice", "context":"visitor count 100", "url":"https://example.edu/notice?id=4&utm_source=first", "site_id":"test-site", "sent_at":utc_now(), "_item_id":"sent-old"}
+    _remember_sent_fingerprint(state, sent_record, "sent-old")
+    new_record = {"title":"Exam Form Notice", "context":"visitor count 900", "url":"https://example.edu/notice?utm_medium=second&id=4"}
+    check(_is_duplicate_by_pdf_hash(state, new_record, exclude_iid="new-id") == "Exam Form Notice", "Previously sent HTML notice was not deduplicated")
+
+    legacy_state = default_state()
+    legacy_hash = _legacy_html_content_hash("Old Notice", "old static context that is long enough")
+    legacy_state["html_fingerprints"][legacy_hash] = {"t":"Old Notice", "s":"test-site", "d":utc_now(), "i":"old-id"}
+    legacy_record = {"title":"Old Notice", "context":"old static context that is long enough", "url":"https://example.edu/old-notice"}
+    check(_is_duplicate_by_pdf_hash(legacy_state, legacy_record, exclude_iid="new-id") == "Old Notice", "Legacy html-v1 fingerprint was not recognized")
+
+    rims_menu = ("About Us ► An Introduction Director Administration University Vice-Chancellor "
+                 "RTI PIO Citizen Charter On-going Projects How to Reach RIMS Academics ► "
+                 "Departments Faculty Admission Info Multidisciplinary")
+    check(_looks_like_rims_menu_dump(rims_menu, "https://rimsranchi.ac.in/"), "RIMS menu dump was not detected")
+    check(_should_suppress_rims_candidate({"url":"https://rimsranchi.ac.in/onln_reg_sys.php", "title":"For Online OPD Registration, click here"}), "RIMS OPD service URL was not suppressed")
+    check(not _should_suppress_rims_candidate({"url":"https://rimsranchi.ac.in/notifications-order.php", "title":"Notice Regarding Examination Schedule"}), "Real RIMS notice page was incorrectly suppressed")
+    check(_should_suppress_site_noise({"url":"https://nusrlranchi.ac.in/about-us/", "title":"Visit NUSRL Campus Read More chevron_right"}), "NUSRL About Us page was not suppressed")
+    check(_should_suppress_site_noise({"url":"https://nusrlranchi.ac.in/", "title":"Visit NUSRL Campus modern classrooms Life at NUSRL Read More chevron_right"}), "NUSRL homepage marketing dump was not suppressed")
+    check(not _should_suppress_site_noise({"url":"https://nusrlranchi.ac.in/announcements/", "title":"List of Provisionally Eligible Candidates for PG Diploma Programmes"}), "Real NUSRL announcement was incorrectly suppressed")
+    check(not _looks_like_rims_menu_dump("Notice Regarding Examination Schedule", "https://rimsranchi.ac.in/notifications-order.php"), "Real RIMS notice title was classified as menu text")
+
+    # Stale-date regressions: amendment wording must not bypass strict PDF dates.
+    old_pdf = "Office Order dated 12-03-2022; Examination Notice"
+    check(_is_stale_notice("Revised Examination Notice", "", "https://example.edu/notice.pdf", pdf_text=old_pdf, strict_pdf_date=True),
+          "Old PDF date was bypassed by Revised/Examination title")
+    recent_pdf = "Examination Notice dated 24-10-2026"
+    check(not _is_stale_notice("Revised Examination Notice", "", "https://example.edu/notice.pdf", pdf_text=recent_pdf, strict_pdf_date=True),
+          "Recent PDF date was incorrectly rejected")
+    old_with_copyright = ("Office Order dated 12-03-2023\nExamination Notice\nDetails of examination\n" 
+                          "Upcoming Event 2026\n© 2026 Vinoba Bhave University")
+    check(_is_stale_notice("Examination Notice", "", "https://example.edu/old.pdf", pdf_text=old_with_copyright, strict_pdf_date=True),
+          "Footer Upcoming Event year incorrectly refreshed an old 2023 notice")
+    recent_labelled = ("Examination Notice\nDate: 24-10-2026\nDetails below\n" 
+                       "© 2026 University")
+    check(not _is_stale_notice("Examination Notice", "", "https://example.edu/new.pdf", pdf_text=recent_labelled, strict_pdf_date=True),
+          "Recent labelled issue date was not accepted")
+    undated_old_footer = ("Examination Notice\nCandidates are informed about examination.\n" 
+                          "Upcoming Event 2026\n© 2026 University")
+    check(not _is_stale_notice("Examination Notice", "", "https://example.edu/undated.pdf", upload_date=datetime(2023, 1, 1, tzinfo=timezone.utc), pdf_text=undated_old_footer, strict_pdf_date=True),
+          "Undated PDF was incorrectly marked stale from HTML upload date or footer-only year")
+    check(not _is_stale_notice("Corrigendum Examination Notice", "", "https://example.edu/notice.pdf", upload_date=datetime(2022, 1, 1, tzinfo=timezone.utc), pdf_text="Notice regarding examination; no date printed", strict_pdf_date=True),
+          "Undated document was incorrectly marked stale only from old HTML upload date")
+
+    # Fallback classifier tests: no Gemini keys must not turn every candidate into spam.
+    fallback = keyword_fallback([
+        {"title": "Examination Notice - MLIS Semester I", "url": "https://example.edu/notices/mlis.pdf"},
+        {"title": "Home About Us Contact Us Gallery", "url": "https://example.edu/"},
+        {"title": "University Update", "url": "https://example.edu/page", "context": "A potentially relevant university update"},
+    ])
+    check(fallback["0"]["important"] is True, "Specific exam notice was missed by keyword fallback")
+    check(fallback["1"]["important"] is False, "Navigation noise was marked important by keyword fallback")
+    check(fallback["2"].get("needs_review") is True and fallback["2"]["important"] is False,
+          "Ambiguous no-Gemini candidate was not routed for review")
+    mixed_old = ("Office Order dated 12-03-2023\nExamination Notice\nDetails of examination\n"
+                 "Upcoming Event 2026\n© 2026 Vinoba Bhave University")
+    check(_is_stale_notice("Examination Notice", "", "https://example.edu/event.pdf", pdf_text=mixed_old, strict_pdf_date=True),
+          "Footer Upcoming Event year incorrectly refreshed an old issue date")
+    irrelevant_future = ("Office Order dated 12-03-2023\nExamination Notice\nDetails of examination\n"
+                         "© 2026 Vinoba Bhave University\nAll rights reserved")
+    check(_is_stale_notice("Examination Notice", "", "https://example.edu/old.pdf", pdf_text=irrelevant_future, strict_pdf_date=True),
+          "Copyright year alone refreshed an old notice")
+
+    # Cache tests use a tiny local key/value pair; no network or Telegram access.
+    _cache_clear()
+    _cache_put("self-test-pdf", b"pdf-test-content")
+    check(_cache_get("self-test-pdf") == b"pdf-test-content", "PDF cache write/read failed")
+    _cache_clear()
+    check(_cache_get("self-test-pdf") is None, "PDF cache clear failed")
+
+    plain_html = {"title":"Examination Notice", "url":"https://example.edu/notice", "is_pdf":False, "is_image":False, "pdf_text":"Notice dated 24-10-2026", "pdf_extracted":False}
+    check(_attachment_verification_gate(plain_html) == (False, "plain_html_without_pdf_or_image_attachment"),
+          "Plain HTML without PDF/image was allowed to send")
+    unreadable_pdf = {"title":"Examination Notice", "url":"https://example.edu/notice.pdf", "is_pdf":True, "pdf_text":"", "pdf_extracted":False}
+    check(_attachment_verification_gate(unreadable_pdf) == (False, "attachment_not_readable_or_ocr_failed"),
+          "Unreadable PDF was allowed to send without verification")
+    readable_pdf = {"title":"Examination Notice", "url":"https://example.edu/notice.pdf", "is_pdf":True, "pdf_text":"Examination notice issued on 24-10-2026. Candidates should follow the instructions.", "pdf_extracted":True}
+    check(_attachment_verification_gate(readable_pdf)[0] is True,
+          "Readable PDF with extracted text was incorrectly blocked")
+    readable_image = {"title":"Examination Notice", "url":"https://example.edu/notice.jpg", "is_image":True, "pdf_text":"Examination notice issued on 24-10-2026. Candidates should follow the instructions.", "pdf_extracted":True}
+    check(_attachment_verification_gate(readable_image)[0] is True,
+          "Readable image OCR was incorrectly blocked")
+
+    # Attachment-first global queue priority: PDF > image > HTML-only.
+    priority_pdf = {"url": "https://example.edu/notices/exam.pdf", "title": "Exam Notice", "is_pdf": True}
+    priority_image = {"url": "https://example.edu/notices/admit-card.jpg", "title": "Admit Card", "is_image": True}
+    priority_html = {"url": "https://example.edu/notices/exam", "title": "Exam Notice", "is_pdf": False, "is_image": False}
+    check(_attachment_priority(priority_pdf) == 2, "PDF attachment did not receive highest queue priority")
+    check(_attachment_priority(priority_image) == 1, "Image attachment did not receive second queue priority")
+    check(_attachment_priority(priority_html) == 0, "HTML-only candidate did not receive lower attachment priority")
+    check(_attachment_priority(priority_pdf) > _attachment_priority(priority_html), "PDF priority was not higher than HTML-only")
+    check(_attachment_priority(priority_image) > _attachment_priority(priority_html), "Image priority was not higher than HTML-only")
+
+    check(_diagnostic_category("HTTP 403 Forbidden") == "http_403_forbidden",
+          "Global failure diagnostic did not classify HTTP 403")
+    check(_diagnostic_category("403 Client Error: Forbidden for url") == "http_403_forbidden",
+          "Requests-style HTTP 403 error was not classified")
+    check(_diagnostic_category("429 Client Error: Too Many Requests") == "http_429_rate_limited",
+          "Requests-style HTTP 429 error was not classified")
+    check(_diagnostic_category("503 Server Error: Service Unavailable") == "http_5xx_server_error",
+          "Requests-style HTTP 5xx error was not classified")
+    check(_diagnostic_category("playwright_nav_error:TimeoutError") == "javascript_render_failed",
+          "Global failure diagnostic did not classify Playwright failure")
+    check(_diagnostic_category("ConnectionError: connection refused") == "dns_or_connection",
+          "Global failure diagnostic did not classify connection failure")
+    check(_diagnostic_category("No error recorded", "http_403") == "http_403_forbidden",
+          "PDF method hint did not classify blank-error HTTP 403")
+    check(_diagnostic_category("", "image_http_429") == "http_429_rate_limited",
+          "Image method hint did not classify HTTP 429")
+    check(_diagnostic_category("", "http_503") == "http_5xx_server_error",
+          "PDF method hint did not classify HTTP 5xx")
+    check(_diagnostic_category("", "http_404") == "http_4xx_client_error",
+          "PDF method hint did not classify HTTP 4xx")
+    check(_diagnostic_category("No error recorded", "image_ocr_no_text") == "pdf_extraction_empty",
+          "Empty OCR result was not categorized separately")
+    check(_diagnostic_category("", "image_size_limit") == "pdf_size_limit",
+          "Attachment size limit was not categorized separately")
+    check(_diagnostic_stage("", "image_ocr_no_text") == "image_ocr",
+          "Image OCR failure stage was not inferred")
+    check(_diagnostic_stage("", "image_http_403") == "image_download",
+          "Image download failure stage was not inferred")
+    diag_record = {}
+    _set_failure_diagnostic(diag_record, "pdf_download", "pdf_download:http_403", "http_403")
+    check(diag_record.get("last_failure_category") == "http_403_forbidden" and diag_record.get("last_failure_stage") == "pdf_download",
+          "Structured failure diagnostics were not persisted")
+    print(f"[SELF-TEST] PASS: {checks} offline regression checks; no websites or Telegram messages used.")
+    return 0
+
+
+def _attachment_verification_gate(record):
+    """Return (allowed, reason) before Telegram delivery.
+
+    HTML text is still parsed/classified for discovery and verification, but a
+    plain HTML page with no linked PDF/image candidate is not itself sent.
+    PDFs/images must have readable extracted text before delivery; failed OCR or
+    download remains retryable instead of being sent unverified.
+    """
+    is_pdf_item = bool(record.get("is_pdf") or is_pdf(str(record.get("url", ""))) or _looks_like_pdf_url(str(record.get("url", ""))))
+    is_image_item = bool(record.get("is_image") or urlparse(str(record.get("url", ""))).path.lower().endswith(
+        (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")))
+    if not is_pdf_item and not is_image_item:
+        return False, "plain_html_without_pdf_or_image_attachment"
+    extracted = bool(record.get("pdf_extracted"))
+    readable_text = clean_text(record.get("pdf_text", ""), MAX_PDF_TEXT_CHARS).strip()
+    if not extracted or len(readable_text) < 25:
+        return False, "attachment_not_readable_or_ocr_failed"
+    return True, "verified_attachment_text_available"
+
+
+def main():
+    global STALE_NOTICE_DAYS, _RUNTIME_PDF_CACHE, _RUNTIME_PDF_CACHE_BYTES, _OCR_CONTENT_CACHE
+    global _GEMINI_API_KEY, _GEMINI_QUOTA_EXHAUSTED
+    global _GEMINI_KEYS_POOL, _GEMINI_KEY_INDEX, _GEMINI_DEAD_KEYS, _MODELS_DISCOVERED, _DYNAMIC_MODELS
+    global _JS_RENDER_COUNT
+    _RUNTIME_PDF_CACHE = {}
+    _RUNTIME_PDF_CACHE_BYTES = 0
+    _OCR_CONTENT_CACHE = {}
+    with _JS_RENDER_COUNT_LOCK: _JS_RENDER_COUNT = 0
+    _DEAD_MODELS.clear()
+    _GEMINI_QUOTA_EXHAUSTED = False
+    _GEMINI_KEYS_POOL = _load_gemini_keys()
+    _GEMINI_KEY_INDEX = 0
+    _GEMINI_DEAD_KEYS = set()
+    _MODELS_DISCOVERED = False
+    _DYNAMIC_MODELS = []
+
+    import time as _time
+    _START_TIME = _time.monotonic()
+    _MAX_RUN_SECONDS = int(os.getenv("MAX_RUN_SECONDS", str(90 * 60)))
+    _SEND_RESERVE_SECONDS = int(os.getenv("SEND_RESERVE_SECONDS", "900"))
+    send_deadline = _START_TIME + _MAX_RUN_SECONDS - _SEND_RESERVE_SECONDS
+    def _time_exceeded(): return (_time.monotonic() - _START_TIME) > _MAX_RUN_SECONDS
+
+    try:
+        cfg = get_config()
+        state = load_state()
+    except Exception as exc:
+        print(f"[FATAL] Configuration/state error: {exc}", file=sys.stderr)
+        return 2
+
+    for _site in cfg["websites"]:
+        _s = site_state(state, _site["id"])
+        if not _s.get("baseline_complete", False):
+            print(f"[BASELINE-STUCK] {_site['name']} | reason={_s.get('baseline_pending_reason', 'unknown')} | last_error={_s.get('last_error', 'none')} | failures={_s.get('consecutive_failures', 0)}", file=sys.stderr)
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    _GEMINI_API_KEY = gemini_key or (_GEMINI_KEYS_POOL[0] if _GEMINI_KEYS_POOL else "")
+    if not token or not chat_id:
+        print("[FATAL] TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required.", file=sys.stderr)
+        return 2
+    if not _GEMINI_KEYS_POOL:
+        print("[FATAL] No Gemini API keys configured. Set GEMINI_API_KEYS or GEMINI_API_KEY.", file=sys.stderr)
+        return 2
+    print(f"[INFO] Loaded {len(_GEMINI_KEYS_POOL)} unique Gemini API key(s).", file=sys.stderr)
+    print(f"[INFO] OCR engines: Gemini={GEMINI_PDF_OCR_ENABLED}, PaddleOCR=DISABLED, RapidOCR={_RAPIDOCR_AVAILABLE}, Tesseract={_TESSERACT_AVAILABLE}", file=sys.stderr)
+    if not cfg["websites"]:
+        print("[FATAL] No enabled websites configured.", file=sys.stderr)
+        return 2
+    try: validate_telegram_token(token)
+    except Exception as exc:
+        print(f"[FATAL] Telegram validation failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"[INFO] Playwright available: {_PLAYWRIGHT_AVAILABLE}, JS_RENDER_ENABLED: {JS_RENDER_ENABLED}", file=sys.stderr)
+    _discover_models()
+    scan = cfg["scan"]
+    STALE_NOTICE_DAYS = scan.get("stale_notice_days", STALE_NOTICE_DAYS)
+    state["stats"]["runs"] = int(state["stats"].get("runs", 0)) + 1
+    state["last_run"] = utc_now()
+    run_errors = 0
+    partial_errors_this_run = 0
+    results = {}
+
+    sites_to_scan = []
+    for site in cfg["websites"]:
+        ss = site_state(state, site["id"])
+        q_until = _parse_utc_timestamp(ss.get("quarantined_until"))
+        if q_until and q_until > datetime.now(timezone.utc):
+            print(
+                f"[QUARANTINE] skip {site['name']} until {q_until.isoformat()} "
+                f"reason={ss.get('quarantine_reason', 'N/A')}",
+                file=sys.stderr,
+            )
+            results[site["id"]] = {
+                "candidates": [],
+                "errors": [f"quarantined: {ss.get('quarantine_reason', '')}"],
+                "success": False,
+            }
+            continue
+        sites_to_scan.append(site)
+
+    workers = min(scan["max_workers"], max(1, len(sites_to_scan)))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = {executor.submit(scan_site, site, scan): site for site in sites_to_scan}
+        for future in as_completed(futures):
+            site = futures[future]
+            try:
+                sid, candidates, errors, success = future.result()
+                results[sid] = {"candidates": candidates, "errors": errors, "success": success}
+                if success:
+                    mark_site_success(state, sid, len(candidates))
+                    state["metrics"]["site_scan_success"][sid] = state["metrics"]["site_scan_success"].get(sid, 0) + 1
+                    if errors:
+                        state["metrics"]["parse_errors"] = int(state["metrics"].get("parse_errors", 0)) + len(errors)
+                        partial_errors_this_run += len(errors)
+                    _partial_categories = Counter(_diagnostic_category(err) for err in errors)
+                    print(f"[OK] {site['name']}: {len(candidates)} candidate(s), {len(errors)} partial error(s)")
+                    if errors:
+                        print(f"[SITE-PARTIAL-FAILURE] name={site['name']} site_id={sid} category_counts=" +
+                              ",".join(f"{k}:{v}" for k, v in _partial_categories.most_common()) +
+                              " examples=" + " | ".join(_safe_error_detail(e, 180) for e in errors[:4]), file=sys.stderr)
+                else:
+                    run_errors += 1
+                    state["metrics"]["site_scan_failure"][sid] = state["metrics"]["site_scan_failure"].get(sid, 0) + 1
+                    mark_site_failure(state, sid, "; ".join(errors) or "No page could be fetched")
+                    _categories = Counter(_diagnostic_category(err) for err in errors)
+                    print(f"[SITE-FAILURE] name={site['name']} site_id={sid} category_counts=" +
+                          (",".join(f"{k}:{v}" for k, v in _categories.most_common()) or "no_error_details") +
+                          f" reason={_safe_error_detail('; '.join(errors) or 'No page could be fetched', 700)}", file=sys.stderr)
+                    for err in errors[:10]:
+                        print(f"    ↳ category={_diagnostic_category(err)} detail={_safe_error_detail(err, 400)}", file=sys.stderr)
+                    if len(errors) > 5: print(f"    ↳ ... and {len(errors) - 5} more error(s)", file=sys.stderr)
+            except Exception as exc:
+                run_errors += 1
+                state["metrics"]["site_scan_failure"][site["id"]] = state["metrics"]["site_scan_failure"].get(site["id"], 0) + 1
+                results[site["id"]] = {"candidates": [], "errors": [str(exc)], "success": False}
+                mark_site_failure(state, site["id"], str(exc))
+                print(f"[SITE-FAILURE] name={site['name']} site_id={site['id']} category={_diagnostic_category(exc)} exception={type(exc).__name__} reason={_safe_error_detail(exc, 700)}", file=sys.stderr)
+
+    with _JS_RENDER_COUNT_LOCK: state.setdefault("metrics", {})["js_renders"] = _JS_RENDER_COUNT
+    try:
+        threshold = scan.get("site_alert_threshold", 3)
+        cooldown = scan.get("site_alert_cooldown_hours", 6)
+        _check_and_send_site_alerts(state, cfg, token, chat_id, threshold, cooldown)
+    except Exception as exc: print(f"[WARN] Site alert check failed: {exc}", file=sys.stderr)
+
+    site_index = build_site_index(state)
+    pending = []
+
+    for site in cfg["websites"]:
+        sid = site["id"]
+        ss = site_state(state, sid)
+        result = results.get(sid, {"candidates": [], "success": False})
+        candidates = result["candidates"]
+        current_scan_success = bool(result["success"])
+        baseline_scan_complete = baseline_can_complete(current_scan_success, result.get("errors", []), int(site.get("baseline_max_errors", scan.get("baseline_max_errors", 3))))
+        if not ss["baseline_complete"] and baseline_scan_complete:
+            for candidate in candidates:
+                if _should_suppress_site_noise(candidate):
+                    print(f"[FILTER] Baseline navigation/service candidate suppressed: {str(candidate.get('url', ''))[:100]}", file=sys.stderr)
+                    continue
+                iid = item_id(sid, candidate["url"], candidate["title"], candidate.get("context", ""))
+                state["items"].setdefault(iid, {"site_id": sid, "site_name": site["name"], "url": candidate["url"], "title": candidate["title"], "explicit_title": candidate.get("explicit_title", ""), "context": candidate.get("context", "")[:700], "is_pdf": bool(candidate.get("is_pdf")), "is_image": bool(candidate.get("is_image")), "first_seen": utc_now(), "last_seen": utc_now(), "status": "baseline", "attempts": 0, "summary": "", "classification": None, "pdf_extracted": False, "pdf_text": "", "pdf_attempts": 0, "ocr_used": False, "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False, "upload_date": candidate.get("upload_date"), "last_error": None, "etag": None, "last_modified": None, "pdf_hash": None, "pdf_hash_kind": None, "last_content_check_at": None})
+            ss["baseline_complete"] = True
+            ss["baseline_completed_at"] = utc_now()
+            ss.pop("baseline_pending_reason", None)
+            print(f"[BASELINE] {site['name']} initialized with {len(candidates)} item(s)")
+            continue
+        elif not ss["baseline_complete"]:
+            ss["baseline_pending_reason"] = "scan failed or partial errors; baseline withheld to prevent archive spam"
+            print(f"[BASELINE-PENDING] {site['name']}: waiting for a complete scan", file=sys.stderr)
+            continue
+
+        site_items_list = site_index.get(sid, [])
+        for candidate in candidates:
+            if _should_suppress_site_noise(candidate):
+                print(f"[FILTER] Navigation/service candidate suppressed: {str(candidate.get('url', ''))[:100]}", file=sys.stderr)
+                continue
+            iid = item_id(sid, candidate["url"], candidate["title"], candidate.get("context", ""))
+            record = state["items"].get(iid)
+            upload_dt = _parse_upload_date(candidate.get("upload_date"))
+            effective_cand_title = candidate.get("explicit_title") or candidate.get("title", "")
+            if _is_stale_notice(effective_cand_title, candidate.get("context", ""), candidate.get("url", ""), upload_date=upload_dt):
+                reason = _classify_stale_reason(effective_cand_title, candidate.get("context", ""), candidate.get("url", ""), upload_date=upload_dt) or "STALE"
+                matched_iid = iid if record is not None else find_url_match(site_items_list, candidate["url"])
+                if not matched_iid and record is None: matched_iid = find_fuzzy_match(site_items_list, candidate.get("title", ""), candidate.get("url", ""))
+                if matched_iid and matched_iid in state["items"]:
+                    stale_record = state["items"][matched_iid]
+                    stale_record["last_seen"] = utc_now()
+                    if stale_record.get("status") not in {"sent", "ignored", "permanent_error"}:
+                        stale_record["status"] = "baseline"
+                        stale_record["classification"] = None
+                        stale_record["summary"] = ""
+                        stale_record["last_error"] = f"Stale notice ({reason})"
+                else:
+                    state["items"][iid] = {"site_id": sid, "site_name": site["name"], "url": candidate["url"], "title": candidate.get("title", ""), "explicit_title": candidate.get("explicit_title", ""), "context": candidate.get("context", "")[:700], "is_pdf": bool(candidate.get("is_pdf")), "is_image": bool(candidate.get("is_image")), "first_seen": utc_now(), "last_seen": utc_now(), "status": "baseline", "attempts": 0, "summary": "", "classification": None, "pdf_extracted": False, "pdf_text": "", "pdf_attempts": 0, "ocr_used": False, "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False, "upload_date": candidate.get("upload_date"), "last_error": f"Stale notice ({reason})", "etag": None, "last_modified": None, "pdf_hash": None, "pdf_hash_kind": None, "last_content_check_at": None}
+                    site_items_list.append((iid, candidate.get("title", ""), candidate.get("url", "")))
+                print(f"[{reason}] {effective_cand_title[:80]}", file=sys.stderr)
+                continue
+
+            is_pdf_or_notice = bool(candidate.get("is_pdf") or is_pdf(candidate["url"]) or _looks_like_pdf_url(candidate["url"]))
+            if record is None:
+                matched_iid = find_url_match(site_items_list, candidate["url"])
+                if not matched_iid: matched_iid = find_fuzzy_match(site_items_list, candidate["title"], candidate["url"])
+                if matched_iid and matched_iid in state["items"]:
+                    state["metrics"]["duplicate_rejects"] = int(state["metrics"].get("duplicate_rejects", 0)) + 1
+                    iid = matched_iid
+                    record = state["items"][matched_iid]
+                    old_title = clean_text(record.get("title", ""), 300)
+                    old_context = clean_text(record.get("context", ""), 700)
+                    new_title = clean_text(candidate.get("title", ""), 300)
+                    new_context = clean_text(candidate.get("context", ""), 700)
+                    metadata_changed = _meaningful_metadata_change(old_title, new_title, old_context, new_context)
+                    record["last_seen"] = utc_now()
+                    current_status = record.get("status")
+                    if metadata_changed and current_status in {"ignored", "baseline"}:
+                        if _is_non_notice_pdf(record):
+                            print(f"[SKIP-RE-PROCESS] Non-notice PDF (faculty/other): {candidate['url'][:100]}", file=sys.stderr)
+                        else:
+                            record["status"] = "pending"
+                            record.pop("terminal_at", None)
+                            record["attempts"] = 0; record["last_error"] = None; record["classification"] = None; record["summary"] = ""; record["pdf_extracted"] = False; record["pdf_text"] = ""; record["pdf_attempts"] = 0; record["ocr_used"] = False; record["pdf_method"] = ""
+                            record.pop("pdf_summary_hint", None)
+                            print(f"[RE-PROCESS] Ignored/baseline notice meaningfully changed: {candidate['url'][:100]}")
+                    elif metadata_changed and current_status == "sent":
+                        print(f"[SKIP-RE-PROCESS] Already sent; metadata-only change ignored: {candidate['url'][:100]}")
+                    if new_title: record["title"] = new_title
+                    if candidate.get("explicit_title"): record["explicit_title"] = candidate["explicit_title"]
+                    if new_context: record["context"] = new_context
+                    if candidate.get("upload_date"): record["upload_date"] = candidate["upload_date"]
+                    record["is_pdf"] = bool(record.get("is_pdf") or is_pdf_or_notice)
+                    record["is_image"] = bool(candidate.get("is_image", record.get("is_image", False)))
+                    if record.get("status") == "pending" and int(record.get("attempts", 0)) < scan["max_pending_attempts"]: pending.append((iid, record))
+                    continue
+                upload_dt = _parse_upload_date(candidate.get("upload_date"))
+                if _is_stale_notice(effective_cand_title, candidate.get("context", ""), candidate["url"], upload_date=upload_dt):
+                    reason = _classify_stale_reason(effective_cand_title, candidate.get("context", ""), candidate["url"], upload_date=upload_dt) or "STALE"
+                    state["items"][iid] = {"site_id": sid, "site_name": site["name"], "url": candidate["url"], "title": candidate["title"], "explicit_title": candidate.get("explicit_title", ""), "context": candidate.get("context", "")[:700], "is_pdf": is_pdf_or_notice, "is_image": bool(candidate.get("is_image")), "first_seen": utc_now(), "last_seen": utc_now(), "status": "baseline", "attempts": 0, "summary": "", "classification": None, "pdf_extracted": False, "pdf_text": "", "pdf_attempts": 0, "ocr_used": False, "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False, "upload_date": candidate.get("upload_date"), "last_error": f"Stale ({reason})", "etag": None, "last_modified": None, "pdf_hash": None, "pdf_hash_kind": None, "last_content_check_at": None}
+                    site_items_list.append((iid, candidate["title"], candidate["url"]))
+                    continue
+                record = {"site_id": sid, "site_name": site["name"], "url": candidate["url"], "title": candidate["title"], "explicit_title": candidate.get("explicit_title", ""), "context": candidate.get("context", "")[:700], "is_pdf": is_pdf_or_notice, "is_image": bool(candidate.get("is_image")), "first_seen": utc_now(), "last_seen": utc_now(), "status": "pending", "attempts": 0, "summary": "", "classification": None, "pdf_extracted": False, "pdf_text": "", "pdf_attempts": 0, "ocr_used": False, "pdf_method": "", "telegram_attempts": 0, "pdf_sent": False, "upload_date": candidate.get("upload_date"), "last_error": None, "etag": None, "last_modified": None, "pdf_hash": None, "pdf_hash_kind": None, "last_content_check_at": None}
+                state["items"][iid] = record
+                site_items_list.append((iid, record["title"], record["url"]))
+            else:
+                record["last_seen"] = utc_now()
+                if record.get("status") in ("sent", "ignored"):
+                    should_check = True
+                    try:
+                        checked_at = record.get("last_content_check_at")
+                        if checked_at:
+                            checked_dt = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+                            if checked_dt.tzinfo is None: checked_dt = checked_dt.replace(tzinfo=timezone.utc)
+                            age_days = (datetime.now(timezone.utc) - checked_dt).total_seconds() / 86400
+                            should_check = age_days >= ETAG_CHECK_MAX_AGE_DAYS
+                    except Exception: should_check = True
+                    if should_check:
+                        try:
+                            session = make_session()
+                            changed, new_etag, new_lm = _check_url_changed(session, candidate["url"], record, verify_ssl=_SITE_VERIFY_SSL_BY_ID.get(record.get("site_id"), True))
+                            if changed:
+                                should_reprocess = True
+                                if record.get("status") == "sent" and not record.get("is_pdf", False):
+                                    old_title = (record.get("title") or "").strip()
+                                    new_title = (candidate.get("title") or "").strip()
+                                    if old_title and new_title and fuzz.token_sort_ratio(old_title.lower(), new_title.lower()) >= 90:
+                                        should_reprocess = False
+                                        print(f"[SKIP-ETAG] Same title, HTML content changed (sidebar noise): {candidate['url'][:80]}", file=sys.stderr)
+                                if should_reprocess:
+                                    print(f"[UPDATE] Content changed: {candidate['url'][:80]}", file=sys.stderr)
+                                    record["status"] = "pending"
+                                    record.pop("terminal_at", None)
+                                    record["attempts"] = 0; record["last_error"] = None; record["pdf_extracted"] = False; record["pdf_text"] = ""; record["pdf_attempts"] = 0; record["classification"] = None; record["summary"] = ""
+                                    record.pop("pdf_summary_hint", None)
+                            if new_etag: record["etag"] = new_etag
+                            if new_lm: record["last_modified"] = new_lm
+                            record["last_content_check_at"] = utc_now()
+                        except Exception as exc: print(f"[WARN] ETag check failed: {exc}", file=sys.stderr)
+                if record.get("status") == "baseline":
+                    old_title = (record.get("title") or "").strip()
+                    new_title = (candidate.get("title") or "").strip()
+                    old_context = record.get("context", "")
+                    new_context = candidate.get("context", "")
+                    if _meaningful_metadata_change(old_title, new_title, old_context, new_context):
+                        if _is_non_notice_pdf(record):
+                            print(f"[SKIP-RE-PROCESS] Non-notice PDF (baseline): {candidate['url'][:100]}", file=sys.stderr)
+                        else:
+                            record["status"] = "pending"
+                            record["attempts"] = 0; record["last_error"] = None; record["pdf_extracted"] = False; record["pdf_text"] = ""; record["pdf_attempts"] = 0
+                            record.pop("pdf_summary_hint", None)
+                            print(f"[RE-PROCESS] Substantive baseline metadata change: {new_title[:80]}")
+                if candidate["title"]: record["title"] = candidate["title"]
+                if candidate.get("explicit_title"): record["explicit_title"] = candidate["explicit_title"]
+                if candidate.get("context"): record["context"] = candidate["context"][:700]
+                if candidate.get("upload_date"): record["upload_date"] = candidate["upload_date"]
+                record["is_pdf"] = bool(candidate.get("is_pdf", record.get("is_pdf", False))) or is_pdf_or_notice
+                record["is_image"] = bool(candidate.get("is_image", record.get("is_image", False)))
+            if (ss["baseline_complete"] and record.get("status") == "pending" and int(record.get("attempts", 0)) < scan["max_pending_attempts"]): pending.append((iid, record))
+
+    suppress_stale_pending_and_ready(state)
+    pending = [(iid, record) for iid, record in pending if record.get("status") == "pending"]
+    pending = enqueue_persisted_pending(state, pending, scan["max_pending_attempts"], {site["id"] for site in cfg["websites"]})
+    _safe_pending = []
+    for _iid, _record in pending:
+        if _should_suppress_site_noise(_record):
+            if _record.get("status") == "pending":
+                _record["status"] = "ignored"
+                _record["last_error"] = "Suppressed known navigation/service page; not a notice"
+                _record["terminal_at"] = utc_now()
+            print(f"[FILTER] Suppressed persisted navigation/service item: {str(_record.get('url', ''))[:100]}", file=sys.stderr)
+            continue
+        _safe_pending.append((_iid, _record))
+    pending = _safe_pending
+    state["initialized"] = all(site_state(state, site["id"])["baseline_complete"] for site in cfg["websites"])
+    pending = list({iid: record for iid, record in pending}.items())
+    # Attachment-first scheduling prevents HTML-only candidates with high title
+    # scores from consuming the run budget before their PDF/image notices.
+    # HTML pages are still scanned normally to discover links and metadata.
+    # Rescue never-attempted PDF/image items so they cannot starve.
+    _now = datetime.now(timezone.utc)
+    _starved = []
+    for iid, record in pending:
+        if int(record.get("attempts", 0)) != 0:
+            continue
+        if _attachment_priority(record) == 0:  # HTML-only; not an attachment
+            continue
+        fs = _parse_utc_timestamp(record.get("first_seen"))
+        if fs and (_now - fs).days >= 2:
+            _starved.append((iid, record))
+
+    # Oldest starved attachment first.
+    _starved.sort(key=lambda pair: pair[1].get("first_seen", ""))
+    _starved_reserved = _starved[:5]
+    _starved_ids = {iid for iid, _ in _starved_reserved}
+
+    _rest = [(iid, r) for iid, r in pending if iid not in _starved_ids]
+    _rest.sort(
+        key=lambda pair: (
+            _attachment_priority(pair[1]),
+            pending_priority(pair[1], scan["keywords"]),
+        ),
+        reverse=True,
+    )
+
+    if _starved_reserved:
+        print(
+            f"[STARVATION-RESCUE] reserved={len(_starved_reserved)} slot(s) for never-attempted PDF/image items",
+            file=sys.stderr,
+        )
+
+    pending = _starved_reserved + _rest
+    _priority_counts = {"pdf": 0, "image": 0, "html_only": 0}
+    for _iid, _record in pending:
+        _p = _attachment_priority(_record)
+        _priority_counts["pdf" if _p == 2 else "image" if _p == 1 else "html_only"] += 1
+    print(
+        f"[PENDING-PRIORITY] pdf={_priority_counts['pdf']} image={_priority_counts['image']} "
+        f"html_only={_priority_counts['html_only']} order=pdf>image>html_only",
+        file=sys.stderr,
+    )
+    max_items_this_run = min(scan["gemini_batch_size"] * scan["gemini_max_calls_per_run"], 60)
+    pending = pending[:max_items_this_run]
+
+    batch_size = scan["gemini_batch_size"]
+    for start in range(0, len(pending), batch_size):
+        if _time.monotonic() > send_deadline:
+            print("[TIME_LIMIT] Processing budget reached — remaining items pending for next run", file=sys.stderr)
+            break
+        batch = pending[start : start + batch_size]
+        active_batch = []
+        for iid, record in batch:
+            effective_title = record.get("explicit_title") or record.get("title", "")
+            if _is_stale_notice(effective_title, record.get("context", ""), record.get("url", ""), upload_date=_parse_upload_date(record.get("upload_date")), pdf_text=record.get("pdf_text", "")):
+                record["status"] = "baseline"
+                record["classification"] = None
+                record["summary"] = ""
+                record["last_error"] = "Stale notice suppressed before PDF/Gemini processing"
+                print(f"[STALE-SKIP] Before PDF/Gemini: {effective_title[:80]}", file=sys.stderr)
+                continue
+            title_for_gate = record.get("explicit_title") or record.get("title", "")
+            if _is_generic_title(title_for_gate):
+                record["status"] = "ignored"
+                record["classification"] = {"important": False, "category": "other", "pre_classified": True}
+                record["last_error"] = "Generic UI/table title suppressed before PDF/Gemini processing"
+                record["preclassified_at"] = utc_now()
+                print(f"[PRE-IGNORED] Generic title before PDF fetch: {title_for_gate[:80]}", file=sys.stderr)
+                continue
+            excluded_signal = _matched_excluded_title_signal(title_for_gate, scan.get("exclude_title_signals", _DEFAULT_EXCLUDED_TITLE_SIGNALS))
+            if excluded_signal:
+                record["status"] = "ignored"
+                record["classification"] = {"important": False, "category": "other", "pre_classified": True}
+                record["last_error"] = f"Excluded low-relevance title signal: {excluded_signal}"
+                record["preclassified_at"] = utc_now()
+                print(f"[PRE-IGNORED] Excluded title signal {excluded_signal!r}: {title_for_gate[:80]}", file=sys.stderr)
+                continue
+            active_batch.append((iid, record))
+        batch = active_batch
+        if not batch: continue
+        try: _fetch_pdfs_for_batch(batch, scan, state, send_deadline=send_deadline)
+        except Exception as exc: print(f"[WARN] PDF batch fetch failed: {exc}", file=sys.stderr)
+        try: _fetch_images_for_batch(batch, scan, send_deadline=send_deadline)
+        except Exception as exc: print(f"[WARN] Image OCR batch failed safely: {exc}", file=sys.stderr)
+        try:
+            gemini_batch = []
+            for iid, record in batch:
+                if record.get("status") == "baseline" and str(record.get("last_error", "")).startswith("PDF content stale"): continue
+                pre = _keyword_pre_classify(record, scan.get("exclude_title_signals", _DEFAULT_EXCLUDED_TITLE_SIGNALS))
+                if pre is True:
+                    record["classification"] = {"important": True, "category": "notice", "summary": "", "title_hi": None, "pre_classified": True}
+                    record["summary"] = ""
+                    record["last_error"] = None
+                    record["status"] = "ready"
+                    record["preclassified_at"] = utc_now()
+                    print(f"[PRE-CLASSIFIED] {record.get('title', '')[:70]}")
+                elif pre is False:
+                    if _is_stale_notice(record.get("explicit_title") or record.get("title", ""), "", record.get("url", ""), upload_date=_parse_upload_date(record.get("upload_date")), pdf_text=record.get("pdf_text", "")):
+                        record["classification"] = None
+                        record["summary"] = ""
+                        record["status"] = "baseline"
+                        record["last_error"] = "Stale notice suppressed before classification"
+                        print(f"[STALE-SKIP] {record.get('title', '')[:70]}", file=sys.stderr)
+                    else:
+                        record["classification"] = {"important": False, "category": "other", "pre_classified": True}
+                        record["last_error"] = None
+                        record["status"] = "ignored"
+                        record["preclassified_at"] = utc_now()
+                        print(f"[PRE-IGNORED] Generic/noise title: {record.get('title', '')[:70]}")
+                else: gemini_batch.append((iid, record))
+            result = {}
+            if gemini_batch:
+                if _time.monotonic() > send_deadline:
+                    print(f"[TIME_LIMIT] Gemini budget reached — {len(gemini_batch)} item(s) pending for next run", file=sys.stderr)
+                    for iid, record in gemini_batch:
+                        record["status"] = "pending"
+                        record["last_error"] = "Skipped Gemini — time budget reached"
+                    break
+                result = gemini_classify_with_fallback([record for _, record in gemini_batch], gemini_key, scan["request_timeout_seconds"])
+            for index, (_, record) in enumerate(gemini_batch):
+                record["attempts"] = int(record.get("attempts", 0)) + 1
+                classification = result.get(str(index))
+                if classification is None:
+                    record["status"] = "pending"
+                    record["last_error"] = "Gemini returned no classification"
+                    add_review_item(state, record, "classification_missing")
+                    continue
+                if classification.get("ambiguous") is True or classification.get("needs_review") is True: add_review_item(state, record, "Gemini marked notice ambiguous", classification)
+                strong_signals = ("admission", "result", "admit card", "answer key", "examination", "revaluation", "migration", "scholarship", "fee", "syllabus", "timetable", "counselling", "recruitment", "vacancy", "tender", "notice", "notification", "placement", "convocation", "registration", "प्रवेश", "परिणाम", "प्रवेश पत्र", "उत्तर कुंजी", "परीक्षा", "पुनर्मूल्यांकन", "छात्रवृत्ति", "शुल्क", "भर्ती", "निविदा", "सूचना")
+                combined_title = " ".join((record.get("explicit_title") or "", record.get("title") or "")).casefold()
+                if (not classification.get("important") and record.get("explicit_title") and any(signal in combined_title for signal in strong_signals)):
+                    print(f"[OVERRIDE] Explicit website title has a high-specificity notice signal: {(record.get('explicit_title') or '')[:70]}", file=sys.stderr)
+                    classification["important"] = True
+                    classification["review_reason"] = "explicit_title_strong_signal_override"
+                record["last_error"] = None
+                record["classification"] = classification
+                record["summary"] = classification.get("summary", "")
+                record["status"] = "ready" if classification.get("important") else "ignored"
+        except Exception as exc:
+            error = clean_text(str(exc), 500)
+            for _, record in batch:
+                if record.get("status") in {"ready", "ignored"} and (record.get("classification") or {}).get("pre_classified"): continue
+                record["attempts"] = int(record.get("attempts", 0)) + 1
+                record["status"] = "pending"
+                record["last_error"] = error
+            run_errors += 1
+            print(f"[ERROR] Gemini classification failed: {error}", file=sys.stderr)
+            break
+
+    ready = [(iid, record) for iid, record in state["items"].items() if record.get("status") == "ready" and int(record.get("telegram_attempts", 0) or 0) < TELEGRAM_MAX_ATTEMPTS and _telegram_retry_due(record)]
+    ready.sort(key=lambda pair: pair[1].get("first_seen", ""))
+    sent_count = 0
+    for iid, record in ready[: scan["max_new_items_per_run"]]:
+        # Do not send ordinary HTML pages as Telegram notices. The HTML is still
+        # scanned and used for discovery/classification, but delivery requires a
+        # separately discovered PDF/image whose contents were actually read.
+        effective_title_for_date_gate = record.get("explicit_title") or record.get("title", "")
+        if _needs_undated_old_batch_review(effective_title_for_date_gate, record.get("pdf_text", "")):
+            record["status"] = "pending"
+            record["classification"] = None
+            record["summary"] = ""
+            record["last_error"] = "Delivery blocked: old batch/session in undated PDF requires date review"
+            add_review_item(state, record, "undated_old_batch_requires_review_before_send")
+            print(
+                f"[DATE-REVIEW-HOLD] Delivery blocked before Telegram: "
+                f"{str(effective_title_for_date_gate)[:90]}",
+                file=sys.stderr
+            )
+            continue
+
+        # ═══ FINAL pre-Telegram expired-deadline gate (exact date first, year fallback) ═══
+        expired_final, expired_reason = _pre_send_expired_check(record)
+        if expired_final:
+            record["status"] = "baseline"
+            record["classification"] = None
+            record["summary"] = ""
+            record["last_error"] = f"Pre-send expired-deadline check: {expired_reason}"
+            record["terminal_at"] = utc_now()
+            print(
+                f"[PRE-SEND-EXPIRED] {expired_reason} | {str(record.get('title',''))[:80]}",
+                file=sys.stderr,
+            )
+            continue
+        # ══════════════════════════════════════════════════════════════════════════════════
+
+        print(f"[ATTACHMENT-DIAGNOSTIC] site_id={record.get('site_id','unknown')} url={str(record.get('url',''))[:120]} pdf_attempts={record.get('pdf_attempts',0)} extracted={bool(record.get('pdf_extracted'))} text_chars={len(record.get('pdf_text','') or '')}", file=sys.stderr)
+        attachment_ok, attachment_reason = _attachment_verification_gate(record)
+        if not attachment_ok:
+            if attachment_reason == "plain_html_without_pdf_or_image_attachment":
+                record["status"] = "ignored"
+                record["last_error"] = "Not sent: HTML-only candidate has no PDF/image attachment"
+                record["terminal_at"] = utc_now()
+                print(f"[NO-ATTACHMENT-SKIP] HTML-only candidate not sent: {str(record.get('title', ''))[:90]}", file=sys.stderr)
+            else:
+                # Keep retryable: attachment download/OCR failures must not be
+                # silently sent as a text-only notification or terminally lost.
+                record["status"] = "pending"
+                record["attempts"] = int(record.get("attempts", 0) or 0) + 1
+                record["last_error"] = f"Attachment verification incomplete: {attachment_reason}"
+                add_review_item(state, record, "attachment_read_failed_before_send")
+                print(f"[ATTACHMENT-RETRY] Not sent until PDF/image text is readable: {str(record.get('title', ''))[:90]}", file=sys.stderr)
+            continue
+        if _time_exceeded():
+            print("[TIME_LIMIT] Run time exhausted — unsent notices remain ready for next run", file=sys.stderr)
+            break
+        site = next((s for s in cfg["websites"] if s["id"] == record.get("site_id")), None)
+        if site is None:
+            record["status"] = "permanent_error"
+            record["last_error"] = "Configured site no longer exists"
+            continue
+        # Last-chance fingerprinting before delivery: if PDF bytes are cached
+        # but an earlier stage did not persist a hash, still run cross-URL dedup.
+        if not record.get("pdf_hash") and (
+            record.get("is_pdf") or is_pdf(str(record.get("url", ""))) or
+            _looks_like_pdf_url(str(record.get("url", "")))
+        ):
+            cached_bytes = _cache_get(str(record.get("url", "")))
+            if cached_bytes:
+                try:
+                    fp = _pdf_content_fingerprint(cached_bytes)
+                    if fp:
+                        record["pdf_hash"] = fp
+                        record["pdf_hash_kind"] = fp.split(":", 1)[0]
+                except Exception as exc:
+                    print(f"[WARN] Final PDF fingerprint retry failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+        duplicate_title = _is_duplicate_by_pdf_hash(state, record, exclude_iid=iid)
+        if duplicate_title:
+            print(f"[DEDUP-HASH] {record.get('title', '')[:60]} matches sent notice: {duplicate_title[:60]}", file=sys.stderr)
+            record["status"] = "ignored"
+            record["last_error"] = f"Duplicate PDF/content fingerprint of sent notice: {duplicate_title[:120]}"
+            state.setdefault("metrics", {})["duplicate_rejects"] = int(state.setdefault("metrics", {}).get("duplicate_rejects", 0)) + 1
+            continue
+        full_message = format_message(site, record, record.get("classification"))
+        full_message = truncate_telegram(full_message)
+        is_pdf_flag = record.get("is_pdf", False)
+        is_image_flag = record.get("is_image", False)
+        if SEND_PDF_ENABLED and is_pdf_flag:
+            ok, permanent, detail = send_notification_with_pdf(token, chat_id, record, full_message)
+        elif is_image_flag:
+            ok, permanent, detail = send_notification_with_image(token, chat_id, record, full_message)
+        else:
+            ok, permanent, detail = send_telegram(token, chat_id, full_message)
+        record["telegram_attempts"] = int(record.get("telegram_attempts", 0)) + 1
+        if ok:
+            state["metrics"]["sent_notifications"] = int(state["metrics"].get("sent_notifications", 0)) + 1
+            record["status"] = "sent"
+            record["sent_at"] = utc_now()
+            _remember_sent_fingerprint(state, record, iid)
+            record["last_error"] = None
+            record.pop("telegram_next_attempt_at", None)
+            record.pop("telegram_first_failed_at", None)
+            sent_count += 1
+        elif permanent:
+            state["metrics"]["failed_notifications"] = int(state["metrics"].get("failed_notifications", 0)) + 1
+            record["status"] = "permanent_error"
+            record["last_error"] = detail
+            record.pop("telegram_next_attempt_at", None)
+            run_errors += 1
+            print(f"[ERROR] Permanent Telegram error: {detail}", file=sys.stderr)
+        else:
+            state["metrics"]["failed_notifications"] = int(state["metrics"].get("failed_notifications", 0)) + 1
+            record["status"] = "ready"
+            record["last_error"] = detail
+            _schedule_telegram_retry(record)
+            run_errors += 1
+            print(f"[WARN] Telegram delivery failed; retry at {record.get('telegram_next_attempt_at')}: {detail}", file=sys.stderr)
+
+    try:
+        should_alert = run_errors > 0
+        last_health_alert = state.get("last_health_alert_at")
+        if last_health_alert:
+            health_dt = _parse_utc_timestamp(last_health_alert)
+            if health_dt and (datetime.now(timezone.utc) - health_dt).total_seconds() < 24 * 3600: should_alert = False
+        if should_alert:
+            alert_msg = (f"⚠️ <b>Monitor Health Alert</b>\n\nIs run me {run_errors} error(s) record hue.\nDelivered notices in this run: {sent_count}.\nRun time: {state.get('last_run', 'unknown')}")
+            ok, _permanent, detail = send_telegram(token, chat_id, alert_msg)
+            if ok:
+                state["last_health_alert_at"] = utc_now()
+                print(f"[ALERT] Run completed with {run_errors} error(s)", file=sys.stderr)
+            else: print(f"[WARN] Health alert not delivered: {detail}", file=sys.stderr)
+        if sent_count > 0: state["last_successful_notify_at"] = utc_now()
+    except Exception as exc: print(f"[WARN] Health alert check failed: {exc}", file=sys.stderr)
+    _cache_clear()
+    try:
+        state["stats"]["errors"] = int(state["stats"].get("errors", 0)) + run_errors
+        prune_state(state, scan["retention_days"], scan["max_state_items"], scan["max_pending_attempts"], scan["max_state_bytes"], sent_retention_days=scan["sent_retention_days"], ignored_retention_days=scan["ignored_retention_days"], baseline_retention_days=scan["baseline_retention_days"], max_sent_fingerprints=scan["max_sent_fingerprints"], max_html_fingerprints=scan["max_html_fingerprints"])
+        refresh_stats(state)
+        atomic_save_json(STATE_FILE, state, max_bytes=scan["max_state_bytes"])
+        try: print(f"[STATE] records={len(state.get('items', {}))} bytes={STATE_FILE.stat().st_size}")
+        except OSError: pass
+    except Exception as exc:
+        state.setdefault("metrics", {})["state_save_failures"] = int(state.get("metrics", {}).get("state_save_failures", 0)) + 1
+        print(f"[FATAL] State save failed: {exc}", file=sys.stderr)
+        return 1
+    elapsed = _time.monotonic() - _START_TIME
+    for _site in cfg["websites"]:
+        _sid = _site["id"]
+        _result = results.get(_sid, {})
+        _site_state = site_state(state, _sid)
+        print(f"[SITE-SUMMARY] id={_sid} success={bool(_result.get('success'))} candidates={len(_result.get('candidates', []))} partial_errors={len(_result.get('errors', []))} baseline_complete={bool(_site_state.get('baseline_complete'))} consecutive_failures={int(_site_state.get('consecutive_failures', 0) or 0)}")
+    _pending_reasons = Counter()
+    _oldest_pending = None
+    for _record in state.get("items", {}).values():
+        if not isinstance(_record, dict) or _record.get("status") != "pending": continue
+        _reason = clean_text(str(_record.get("last_error") or "no_error_detail"), 80)
+        _pending_reasons[_reason] += 1
+        _stamp = _parse_utc_timestamp(_record.get("first_seen"))
+        if _stamp and (_oldest_pending is None or _stamp < _oldest_pending): _oldest_pending = _stamp
+    if _pending_reasons:
+        print("[PENDING-BREAKDOWN] " + "; ".join(f"{k}={v}" for k, v in _pending_reasons.most_common(8)))
+    if _oldest_pending:
+        print(f"[PENDING-OLDEST] first_seen={_oldest_pending.isoformat()} age_days={(datetime.now(timezone.utc)-_oldest_pending).total_seconds()/86400:.1f}")
+    # Global pending diagnostics: identical format for every configured university/site.
+    _pending_by_site = {}
+    for _iid, _r in state.get("items", {}).items():
+        if not isinstance(_r, dict) or _r.get("status") != "pending":
+            continue
+        _sid = str(_r.get("site_id") or "unknown")
+        _pending_by_site.setdefault(_sid, []).append((_iid, _r))
+    for _sid, _rows in sorted(_pending_by_site.items()):
+        _reason_counts = Counter(
+            _r.get("last_failure_category") or _diagnostic_category(
+                _r.get("last_failure_reason") or _r.get("last_error"),
+                _r.get("pdf_method", ""), _r.get("last_failure_stage", "")
+            ) for _, _r in _rows
+        )
+        _stage_counts = Counter(_r.get("last_failure_stage") or _diagnostic_stage(
+            _r.get("last_failure_reason") or _r.get("last_error"), _r.get("pdf_method", "")
+        ) for _, _r in _rows)
+        print(f"[SITE-PENDING-DIAGNOSTIC] site_id={_sid} pending={len(_rows)} categories=" +
+              ",".join(f"{_k}:{_v}" for _k, _v in _reason_counts.most_common()) +
+              " stages=" + ",".join(f"{_k}:{_v}" for _k, _v in _stage_counts.most_common()), file=sys.stderr)
+        for _iid, _r in sorted(_rows, key=lambda pair: str(pair[1].get("first_seen") or ""))[:10]:
+            _reason = _safe_error_detail(_r.get("last_failure_reason") or _r.get("last_error") or "No error recorded", 240)
+            _method = str(_r.get("pdf_method") or "unknown")
+            _stage = _r.get("last_failure_stage") or _diagnostic_stage(_reason, _method)
+            _category = _r.get("last_failure_category") or _diagnostic_category(_reason, _method, _stage)
+            print(f"[PENDING-ITEM-DIAGNOSTIC] site_id={_sid} item_id={_iid} url={str(_r.get('url',''))[:140]} "
+                  f"failure_stage={_stage} reason_category={_category} reason={_reason!r} "
+                  f"attempts={_r.get('attempts',0)} pdf_attempts={_r.get('pdf_attempts',0)} "
+                  f"pdf_method={_method} extracted={bool(_r.get('pdf_extracted'))} "
+                  f"telegram_attempts={_r.get('telegram_attempts',0)}", file=sys.stderr)
+    _site_failures = sum(1 for _r in results.values() if not _r.get("success"))
+    _partial_site_errors = sum(len(_r.get("errors", [])) for _r in results.values())
+    print(f"[DONE] initialized={state['initialized']} sites={len(cfg['websites'])} sent_this_run={sent_count} pending={state['stats']['pending']} failed_sites={_site_failures} site_page_errors={_partial_site_errors} errors_this_run={run_errors} partial_errors_this_run={partial_errors_this_run} review_open={sum(1 for x in state.get('review_queue', {}).values() if x.get('status') == 'open')} duplicate_rejects_total={state.get('metrics', {}).get('duplicate_rejects', 0)} js_renders_total={state.get('metrics', {}).get('js_renders', 0)} elapsed={elapsed:.1f}s")
+    return 0
+
+
+if __name__ == "__main__":
+    if "--test" in sys.argv:
+        raise SystemExit(run_self_tests())
+    raise SystemExit(main())
