@@ -1,0 +1,917 @@
+name: Jharkhand University Notice Monitor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: university-notice-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Tesseract OCR + Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr tesseract-ocr-hin tesseract-ocr-eng \
+            xvfb xauth x11-utils
+          tesseract --version
+          tesseract --list-langs
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium (L3)
+        run: python -m playwright install --with-deps chromium
+
+      - name: Install Patchright Chromium (L3.5)
+        run: |
+          pip install "patchright<2,>=1.40"
+          python -m patchright install --with-deps chromium
+
+      - name: Install Camoufox Firefox (L4)
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-0t64 libdbus-glib-1-2t64 libxt6t64 \
+            libx11-xcb1 libxcb-shm0 libxcb-util1 libasound2t64 \
+            xvfb xauth || true
+          pip install "camoufox<1"
+          python -m camoufox fetch
+
+      - name: Verify new browser layers
+        run: |
+          xvfb-run --auto-servernum python - <<'PYEOF'
+          import sys
+          try:
+              from patchright.sync_api import sync_playwright
+              with sync_playwright() as p:
+                  b = p.chromium.launch(headless=False, args=["--no-sandbox","--disable-dev-shm-usage"])
+                  pg = b.new_page()
+                  pg.goto("about:blank")
+                  b.close()
+              print("[VERIFY] Patchright Chromium OK")
+          except Exception as e:
+              print(f"[VERIFY] Patchright FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+          python - <<'PYEOF'
+          import sys
+          try:
+              from camoufox.sync_api import Camoufox
+              with Camoufox(headless=True) as b:
+                  pg = b.new_page()
+                  pg.goto("about:blank")
+              print("[VERIFY] Camoufox Firefox OK")
+          except Exception as e:
+              print(f"[VERIFY] Camoufox FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+      - name: Run self-tests
+        run: python monitor.py --test
+
+      - name: Patch websites.json (batch=5, calls=20)
+        run: |
+          python - <<'PYEOF'
+          from pathlib import Path
+          import json, sys
+          path = Path("websites.json")
+          if not path.exists():
+              print("ERROR: websites.json not found", file=sys.stderr)
+              sys.exit(1)
+          data = json.loads(path.read_text(encoding="utf-8"))
+          scan = data.setdefault("scan", {})
+          old_batch = scan.get("gemini_batch_size", 3)
+          old_calls = scan.get("gemini_max_calls_per_run", 15)
+          if old_batch == 5 and old_calls == 20:
+              print("[PATCH] websites.json already at 5/20. Skipping.")
+              sys.exit(0)
+          scan["gemini_batch_size"] = 5
+          scan["gemini_max_calls_per_run"] = 20
+          path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print(f"[PATCH] gemini_batch_size: {old_batch} -> 5")
+          print(f"[PATCH] gemini_max_calls_per_run: {old_calls} -> 20")
+          PYEOF
+
+      - name: Patch monitor.py (max_pending_attempts validation 500 -> 8)
+        run: |
+          python - <<'PYEOF'
+          from pathlib import Path
+          import sys, ast
+          path = Path("monitor.py")
+          if not path.exists():
+              print("ERROR: monitor.py not found", file=sys.stderr)
+              sys.exit(1)
+          content = path.read_text(encoding="utf-8")
+          old = 'scan["max_pending_attempts"] = max(500, int(scan["max_pending_attempts"]))'
+          new = 'scan["max_pending_attempts"] = max(8, int(scan["max_pending_attempts"]))'
+          if new in content:
+              print("[PATCH] Already patched. Skipping.")
+              sys.exit(0)
+          if old not in content:
+              print("ERROR: Expected line not found", file=sys.stderr)
+              sys.exit(1)
+          patched = content.replace(old, new, 1)
+          path.write_text(patched, encoding="utf-8")
+          ast.parse(patched)
+          print("[PATCH] validation 500 -> 8 applied")
+          PYEOF
+
+      - name: Patch monitor.py (per-run hard cap 60 -> 150)
+        run: |
+          python - <<'PYEOF'
+          from pathlib import Path
+          import sys, ast
+          path = Path("monitor.py")
+          content = path.read_text(encoding="utf-8")
+          old = 'max_items_this_run = min(scan["gemini_batch_size"] * scan["gemini_max_calls_per_run"], 60)'
+          new = 'max_items_this_run = min(scan["gemini_batch_size"] * scan["gemini_max_calls_per_run"], 150)'
+          if new in content:
+              print("[PATCH] Already patched. Skipping.")
+              sys.exit(0)
+          if old not in content:
+              print("ERROR: Expected line not found", file=sys.stderr)
+              sys.exit(1)
+          patched = content.replace(old, new, 1)
+          path.write_text(patched, encoding="utf-8")
+          ast.parse(patched)
+          print("[PATCH] cap 60 -> 150 applied")
+          PYEOF
+
+      - name: Patch monitor.py (starvation rescue 5 -> 20)
+        run: |
+          python - <<'PYEOF'
+          from pathlib import Path
+          import sys, ast
+          path = Path("monitor.py")
+          content = path.read_text(encoding="utf-8")
+          old = '_starved_reserved = _starved[:5]'
+          new = '_starved_reserved = _starved[:20]'
+          if new in content:
+              print("[PATCH] Already patched. Skipping.")
+              sys.exit(0)
+          if old not in content:
+              print("ERROR: Expected line not found", file=sys.stderr)
+              sys.exit(1)
+          patched = content.replace(old, new, 1)
+          path.write_text(patched, encoding="utf-8")
+          ast.parse(patched)
+          print("[PATCH] rescue 5 -> 20 applied")
+          PYEOF
+
+      - name: Patch monitor.py (max_pending_attempts default 500 -> 8)
+        run: |
+          python - <<'PYEOF'
+          from pathlib import Path
+          import sys, ast
+          path = Path("monitor.py")
+          content = path.read_text(encoding="utf-8")
+          if '"max_pending_attempts": 8,' in content:
+              print("[PATCH] Already patched. Skipping.")
+              sys.exit(0)
+          old = '"max_pending_attempts": 500,'
+          new = '"max_pending_attempts": 8,'
+          if content.count(old) != 1:
+              print(f"ERROR: Found {content.count(old)} occurrences (expected 1)", file=sys.stderr)
+              sys.exit(1)
+          patched = content.replace(old, new, 1)
+          path.write_text(patched, encoding="utf-8")
+          ast.parse(patched)
+          print("[PATCH] default 500 -> 8 applied")
+          PYEOF
+
+      - name: Patch monitor.py (pdfplumber layout=True)
+        run: |
+          python - <<'PYEOF'
+          from pathlib import Path
+          import sys, ast
+          path = Path("monitor.py")
+          content = path.read_text(encoding="utf-8")
+          if 'layout=True' in content and 'layout_width_chars=200' in content:
+              print("[PATCH] Already patched. Skipping.")
+              sys.exit(0)
+          old = (
+              '                    text = page.extract_text() or ""\n'
+              '                    if text.strip():\n'
+              '                        parts.append(text)'
+          )
+          new = (
+              '                    try:\n'
+              '                        layout_text = page.extract_text(\n'
+              '                            layout=True,\n'
+              '                            layout_width_chars=200,\n'
+              '                            layout_height_chars=60,\n'
+              '                            x_tolerance=1,\n'
+              '                            y_tolerance=2,\n'
+              '                        ) or ""\n'
+              '                    except Exception:\n'
+              '                        layout_text = ""\n'
+              '                    if layout_text.strip():\n'
+              '                        parts.append(layout_text)\n'
+              '                    else:\n'
+              '                        text = page.extract_text() or ""\n'
+              '                        if text.strip():\n'
+              '                            parts.append(text)'
+          )
+          if content.count(old) != 1:
+              print(f"ERROR: Found {content.count(old)} target blocks", file=sys.stderr)
+              for i, line in enumerate(content.splitlines(), 1):
+                  if 'extract_text()' in line:
+                      print(f"  Line {i}: {line!r}", file=sys.stderr)
+              sys.exit(1)
+          patched = content.replace(old, new, 1)
+          path.write_text(patched, encoding="utf-8")
+          ast.parse(patched)
+          print("[PATCH] layout=True applied")
+          PYEOF
+
+      # ══════════════════════════════════════════════════════════════════
+      # PATCH A: Fix _safety_net_log_only — proper TG-FAILED category
+      # Bug: `if telegram_attempts > 0: continue` silently skips notices
+      # whose Telegram send failed (timeout, 5xx, etc.) but were never
+      # actually delivered. Now uses sent_at to detect real delivery.
+      # ══════════════════════════════════════════════════════════════════
+      - name: Patch monitor.py (safety-net TG-failed category)
+        run: |
+          python - <<'PYEOF'
+          from pathlib import Path
+          import sys, ast
+          path = Path("monitor.py")
+          content = path.read_text(encoding="utf-8")
+
+          # Already patched?
+          if 'tg_failed = []' in content and 'TELEGRAM-FAILED notice(s)' in content:
+              print("[PATCH-A] Already patched. Skipping.")
+              sys.exit(0)
+
+          changes = 0
+
+          # A1: Add tg_failed list
+          old1 = '    items = state.get("items", {}) or {}\n    stuck = []\n    for item_id, record in items.items():'
+          new1 = '    items = state.get("items", {}) or {}\n    stuck = []\n    tg_failed = []\n    for item_id, record in items.items():'
+          if content.count(old1) == 1:
+              content = content.replace(old1, new1, 1); changes += 1
+
+          # A2: Fix skip logic (sent_at check + TG-FAILED category)
+          old2 = '''        telegram_attempts = int(record.get("telegram_attempts", 0) or 0)
+        if telegram_attempts > 0:
+            continue
+        if status == "permanent_error" or ('''
+          new2 = '''        telegram_attempts = int(record.get("telegram_attempts", 0) or 0)
+        sent_at = record.get("sent_at")
+        if status == "sent" or sent_at:
+            continue
+        if telegram_attempts > 0:
+            tg_failed.append({
+                "item_id": item_id,
+                "site_id": record.get("site_id") or "?",
+                "site_name": record.get("site_name") or record.get("site_id") or "?",
+                "title": str(record.get("title") or "")[:140],
+                "url": str(record.get("url") or "")[:200],
+                "status": status,
+                "telegram_attempts": telegram_attempts,
+                "first_failed_at": record.get("telegram_first_failed_at"),
+                "next_attempt_at": record.get("telegram_next_attempt_at"),
+                "last_error": str(record.get("last_error") or "")[:250],
+            })
+            continue
+        if status == "permanent_error" or ('''
+          if content.count(old2) == 1:
+              content = content.replace(old2, new2, 1); changes += 1
+
+          # A3: Add site_name to stuck dict
+          old3 = '''            stuck.append({
+                "item_id": item_id,
+                "site_id": record.get("site_id"),
+                "title": str(record.get("title") or "")[:120],'''
+          new3 = '''            stuck.append({
+                "item_id": item_id,
+                "site_id": record.get("site_id"),
+                "site_name": record.get("site_name") or record.get("site_id"),
+                "title": str(record.get("title") or "")[:120],'''
+          if content.count(old3) == 1:
+              content = content.replace(old3, new3, 1); changes += 1
+
+          # A4: Add TG-FAILED logging block before STUCK logging
+          old4 = '''    if stuck:
+        print(
+            f"[SAFETY-NET-LOG] {len(stuck)} stuck item(s) — manual check required "
+            "(GitHub only, NOT Telegram)",
+            file=sys.stderr,
+        )'''
+          new4 = '''    if tg_failed:
+        print(
+            f"[SAFETY-NET-LOG] {len(tg_failed)} TELEGRAM-FAILED notice(s) — "
+            f"NOT delivered (GitHub only, NOT Telegram)",
+            file=sys.stderr,
+        )
+        for item in tg_failed[:30]:
+            print(
+                f"[SAFETY-NET-LOG] TG-FAILED site={item['site_name']!r} "
+                f"site_id={item['site_id']} title={item['title']!r} "
+                f"tg_attempts={item['telegram_attempts']} status={item['status']} "
+                f"first_failed={item['first_failed_at']} "
+                f"next_attempt={item['next_attempt_at']} "
+                f"last_error={item['last_error']!r} url={item['url']!r}",
+                file=sys.stderr,
+            )
+    if stuck:
+        print(
+            f"[SAFETY-NET-LOG] {len(stuck)} stuck item(s) — manual check required "
+            "(GitHub only, NOT Telegram)",
+            file=sys.stderr,
+        )'''
+          if content.count(old4) == 1:
+              content = content.replace(old4, new4, 1); changes += 1
+
+          # A5: Update STUCK log to include site_name
+          old5 = '''                f"[SAFETY-NET-LOG] STUCK item_id={item['item_id']} "
+                f"site_id={item['site_id']} status={item['status']} "'''
+          new5 = '''                f"[SAFETY-NET-LOG] STUCK site={item['site_name']!r} "
+                f"item_id={item['item_id']} site_id={item['site_id']} status={item['status']} "'''
+          if content.count(old5) == 1:
+              content = content.replace(old5, new5, 1); changes += 1
+
+          # A6: Update return value + state
+          old6 = '''    state["safety_net_last_log_at"] = now_iso
+    return len(stuck)'''
+          new6 = '''    state["safety_net_last_log_at"] = now_iso
+    state["safety_net_last_tg_failed_count"] = len(tg_failed)
+    state["safety_net_last_stuck_count"] = len(stuck)
+    return len(stuck) + len(tg_failed)'''
+          if content.count(old6) == 1:
+              content = content.replace(old6, new6, 1); changes += 1
+
+          if changes != 6:
+              print(f"WARN: Expected 6 changes, applied {changes}", file=sys.stderr)
+              if changes == 0:
+                  sys.exit(1)
+
+          path.write_text(content, encoding="utf-8")
+          ast.parse(content)
+          print(f"[PATCH-A] Safety-net TG-FAILED category fix applied ({changes}/6)")
+          PYEOF
+
+      # ══════════════════════════════════════════════════════════════════
+      # PATCH B: Send queue priority — failed TG retries FIRST
+      # Ensures next run sends previously-failed notices before fresh ones,
+      # without re-running the expensive PDF/OCR/classification pipeline.
+      # ══════════════════════════════════════════════════════════════════
+      - name: Patch monitor.py (send priority: failed TG first)
+        run: |
+          python - <<'PYEOF'
+          from pathlib import Path
+          import sys, ast
+          path = Path("monitor.py")
+          content = path.read_text(encoding="utf-8")
+
+          if '_send_priority' in content:
+              print("[PATCH-B] Already patched. Skipping.")
+              sys.exit(0)
+
+          old = '''    ready = [(iid, record) for iid, record in state["items"].items() if record.get("status") == "ready" and int(record.get("telegram_attempts", 0) or 0) < TELEGRAM_MAX_ATTEMPTS and _telegram_retry_due(record)]
+    ready.sort(key=lambda pair: pair[1].get("first_seen", ""))'''
+          new = '''    ready = [(iid, record) for iid, record in state["items"].items() if record.get("status") == "ready" and int(record.get("telegram_attempts", 0) or 0) < TELEGRAM_MAX_ATTEMPTS and _telegram_retry_due(record)]
+    def _send_priority(pair):
+        _, record = pair
+        telegram_attempts = int(record.get("telegram_attempts", 0) or 0)
+        failed_priority = 0 if telegram_attempts > 0 else 1
+        next_attempt = record.get("telegram_next_attempt_at") or ""
+        first_seen = record.get("first_seen") or ""
+        return (failed_priority, telegram_attempts, next_attempt, first_seen)
+    ready.sort(key=_send_priority)
+    _retry_count = sum(1 for _, r in ready if int(r.get("telegram_attempts", 0) or 0) > 0)
+    if _retry_count:
+        print(
+            f"[SEND-PRIORITY] {_retry_count} failed-TG retry(ies) queued FIRST "
+            f"before fresh notices (PDF/OCR/classification skipped — already done)",
+            file=sys.stderr,
+        )'''
+
+          if content.count(old) != 1:
+              print(f"ERROR: Found {content.count(old)} occurrences (expected 1)", file=sys.stderr)
+              sys.exit(1)
+          patched = content.replace(old, new, 1)
+          path.write_text(patched, encoding="utf-8")
+          ast.parse(patched)
+          print("[PATCH-B] Send priority applied")
+          PYEOF
+
+      # ══════════════════════════════════════════════════════════════════
+      # PATCH C: Enhanced [TG-FAIL] log with site + notice name
+      # Before: "Telegram delivery failed; retry at ..." (no site/title)
+      # After: "[TG-FAIL] site=... title=... attempt=.../... error=..."
+      # ══════════════════════════════════════════════════════════════════
+      - name: Patch monitor.py (TG-FAIL detailed logs)
+        run: |
+          python - <<'PYEOF'
+          from pathlib import Path
+          import sys, ast
+          path = Path("monitor.py")
+          content = path.read_text(encoding="utf-8")
+
+          if '[TG-FAIL]' in content and '[TG-PERMANENT-FAIL]' in content:
+              print("[PATCH-C] Already patched. Skipping.")
+              sys.exit(0)
+
+          changes = 0
+
+          # C1: Temporary TG-FAIL
+          old1 = '''            run_errors += 1
+            print(f"[WARN] Telegram delivery failed; retry at {record.get('telegram_next_attempt_at')}: {detail}", file=sys.stderr)'''
+          new1 = '''            run_errors += 1
+            print(
+                f"[TG-FAIL] site={record.get('site_name')!r} "
+                f"site_id={record.get('site_id')} "
+                f"title={str(record.get('title',''))[:100]!r} "
+                f"attempt={record.get('telegram_attempts')}/{TELEGRAM_MAX_ATTEMPTS} "
+                f"next_retry={record.get('telegram_next_attempt_at')} "
+                f"error={detail!r}",
+                file=sys.stderr,
+            )'''
+          if content.count(old1) == 1:
+              content = content.replace(old1, new1, 1); changes += 1
+
+          # C2: Permanent TG-FAIL
+          old2 = '''            run_errors += 1
+            print(f"[ERROR] Permanent Telegram error: {detail}", file=sys.stderr)'''
+          new2 = '''            run_errors += 1
+            print(
+                f"[TG-PERMANENT-FAIL] site={record.get('site_name')!r} "
+                f"site_id={record.get('site_id')} "
+                f"title={str(record.get('title',''))[:100]!r} "
+                f"attempt={record.get('telegram_attempts')}/{TELEGRAM_MAX_ATTEMPTS} "
+                f"error={detail!r}",
+                file=sys.stderr,
+            )'''
+          if content.count(old2) == 1:
+              content = content.replace(old2, new2, 1); changes += 1
+
+          if changes != 2:
+              print(f"WARN: Expected 2 changes, applied {changes}", file=sys.stderr)
+              if changes == 0:
+                  sys.exit(1)
+
+          path.write_text(content, encoding="utf-8")
+          ast.parse(content)
+          print(f"[PATCH-C] Detailed TG-FAIL logs applied ({changes}/2)")
+          PYEOF
+
+      # ══════════════════════════════════════════════════════════════════
+      # Existing stealth wrapper
+      # ══════════════════════════════════════════════════════════════════
+      - name: Create stealth wrapper (fixed block detector)
+        run: |
+          cat > /tmp/stealth_runner.py <<'PYEOF'
+          import os
+          import sys
+
+          sys.path.insert(0, os.getcwd())
+
+          try:
+              import monitor
+          except SystemExit as exc:
+              import subprocess
+              print(f"[STEALTH] monitor.py exits on import ({exc.code}); running directly", file=sys.stderr)
+              sys.exit(subprocess.call([sys.executable, "monitor.py"] + sys.argv[1:]))
+
+          if not hasattr(monitor, "_render_with_playwright"):
+              print("[STEALTH] WARNING: _render_with_playwright not found. Running vanilla monitor.py.", file=sys.stderr)
+              sys.exit(monitor.main() or 0)
+
+          _orig_render = monitor._render_with_playwright
+
+          _PARAM_ORDER = [
+              "timeout_ms", "wait_until", "wait_for_selector", "wait_after_ms",
+              "scroll_bottom", "selector_timeout_ms", "ignore_https_errors", "use_stealth",
+          ]
+
+          _BLOCK_TITLE_SIGNALS = (
+              "<title>attention required", "<title>just a moment",
+              "<title>access denied", "<title>checking your browser",
+              "<title>please wait", "<title>one more step",
+              "<title>security check", "<title>ddos-guard",
+              "<title>ddos protection by", "<title>bot verification",
+          )
+          _BLOCK_FINGERPRINTS = (
+              "cf-browser-verification", "cf_chl_opt", "challenge-platform/h/b",
+              "window._cf_chl_opt", "_incapsula_resource", "sucuri_cloudproxy_js", "ddos-guard",
+          )
+          _BLOCK_PAGE_MAX_BYTES = 50_000
+
+          def _looks_blocked(html):
+              if not html:
+                  return True
+              if len(html) > _BLOCK_PAGE_MAX_BYTES:
+                  return False
+              head = html[:3000].lower()
+              if any(sig in head for sig in _BLOCK_TITLE_SIGNALS):
+                  return True
+              lower = html.lower()
+              if any(fp in lower for fp in _BLOCK_FINGERPRINTS):
+                  return True
+              return False
+
+          def _should_retry_stealth(html, method):
+              if not html or len(html) < 500:
+                  return True
+              m = (method or "").lower()
+              if "error" in m or "fail" in m:
+                  return True
+              if "ok" in m and len(html) > 10_000:
+                  return False
+              return _looks_blocked(html)
+
+          def _bump_counter():
+              try:
+                  with monitor._JS_RENDER_COUNT_LOCK:
+                      monitor._JS_RENDER_COUNT += 1
+              except Exception:
+                  pass
+
+          def _patchright_render(url, **kw):
+              try:
+                  from patchright.sync_api import sync_playwright
+              except ImportError:
+                  return None, url, "patchright_not_installed"
+              try:
+                  timeout_ms = int(kw.get("timeout_ms") or monitor.JS_RENDER_TIMEOUT_MS)
+              except (TypeError, ValueError):
+                  timeout_ms = monitor.JS_RENDER_TIMEOUT_MS
+              wait_after_ms = kw.get("wait_after_ms")
+              try:
+                  wait_after_ms = int(wait_after_ms if wait_after_ms is not None else monitor.JS_WAIT_AFTER_MS)
+              except (TypeError, ValueError):
+                  wait_after_ms = monitor.JS_WAIT_AFTER_MS
+              wait_for_selector = kw.get("wait_for_selector")
+              try:
+                  selector_timeout_ms = int(kw.get("selector_timeout_ms") or 10000)
+              except (TypeError, ValueError):
+                  selector_timeout_ms = 10000
+              scroll_bottom = bool(kw.get("scroll_bottom", False))
+              ignore_https_errors = bool(kw.get("ignore_https_errors", False))
+              try:
+                  with sync_playwright() as pw:
+                      browser = pw.chromium.launch(
+                          headless=False,
+                          args=["--no-sandbox", "--disable-dev-shm-usage",
+                                "--disable-gpu", "--disable-blink-features=AutomationControlled"],
+                      )
+                      try:
+                          ctx = browser.new_context(
+                              user_agent=monitor.JS_RENDER_USER_AGENT,
+                              locale="en-IN",
+                              viewport={"width": 1366, "height": 900},
+                              java_script_enabled=True,
+                              ignore_https_errors=ignore_https_errors,
+                              extra_http_headers={"Accept-Language": "en-IN,en;q=0.9,hi;q=0.8"},
+                          )
+                          page = ctx.new_page()
+                          try:
+                              page.add_init_script(
+                                  "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                                  "Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});"
+                                  "Object.defineProperty(navigator, 'languages', {get: () => ['en-IN','en','hi']});"
+                                  "window.chrome = { runtime: {} };"
+                              )
+                          except Exception:
+                              pass
+                          page.set_default_timeout(timeout_ms)
+                          try:
+                              page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                          except Exception as exc:
+                              return None, url, f"patchright_nav_error:{type(exc).__name__}"
+                          try:
+                              page.wait_for_load_state("networkidle", timeout=min(8000, timeout_ms))
+                          except Exception:
+                              pass
+                          if wait_for_selector:
+                              try:
+                                  page.wait_for_selector(wait_for_selector, state="attached",
+                                                         timeout=min(selector_timeout_ms, timeout_ms))
+                              except Exception:
+                                  pass
+                          if wait_after_ms:
+                              try:
+                                  page.wait_for_timeout(wait_after_ms)
+                              except Exception:
+                                  pass
+                          if scroll_bottom:
+                              try:
+                                  prev = -1
+                                  for _ in range(4):
+                                      h = page.evaluate("() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)")
+                                      page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                                      page.wait_for_timeout(600)
+                                      if h == prev:
+                                          break
+                                      prev = h
+                              except Exception:
+                                  pass
+                          try:
+                              html = page.content()
+                              final_url = page.url or url
+                          except Exception as exc:
+                              return None, url, f"patchright_content_error:{type(exc).__name__}"
+                          if html:
+                              _bump_counter()
+                          return html, final_url, "patchright_ok"
+                      finally:
+                          try:
+                              browser.close()
+                          except Exception:
+                              pass
+              except Exception as exc:
+                  return None, url, f"patchright_error:{type(exc).__name__}"
+
+          def _camoufox_render(url, **kw):
+              try:
+                  from camoufox.sync_api import Camoufox
+              except ImportError:
+                  return None, url, "camoufox_not_installed"
+              try:
+                  timeout_ms = int(kw.get("timeout_ms") or monitor.JS_RENDER_TIMEOUT_MS)
+              except (TypeError, ValueError):
+                  timeout_ms = monitor.JS_RENDER_TIMEOUT_MS
+              wait_after_ms = kw.get("wait_after_ms")
+              try:
+                  wait_after_ms = int(wait_after_ms if wait_after_ms is not None else monitor.JS_WAIT_AFTER_MS)
+              except (TypeError, ValueError):
+                  wait_after_ms = monitor.JS_WAIT_AFTER_MS
+              ignore_https_errors = bool(kw.get("ignore_https_errors", False))
+              def _attempt(**camoufox_kwargs):
+                  with Camoufox(**camoufox_kwargs) as browser:
+                      page = browser.new_page()
+                      page.set_default_timeout(timeout_ms)
+                      try:
+                          page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                      except Exception as exc:
+                          return None, url, f"camoufox_nav_error:{type(exc).__name__}"
+                      try:
+                          page.wait_for_load_state("networkidle", timeout=min(8000, timeout_ms))
+                      except Exception:
+                          pass
+                      if wait_after_ms:
+                          try:
+                              page.wait_for_timeout(wait_after_ms)
+                          except Exception:
+                              pass
+                      try:
+                          html = page.content()
+                          final_url = page.url or url
+                      except Exception as exc:
+                          return None, url, f"camoufox_content_error:{type(exc).__name__}"
+                      if html:
+                          _bump_counter()
+                      return html, final_url, "camoufox_ok"
+              try:
+                  return _attempt(headless=True, ignore_https_errors=ignore_https_errors)
+              except TypeError:
+                  try:
+                      return _attempt(headless=True)
+                  except Exception as exc:
+                      return None, url, f"camoufox_error:{type(exc).__name__}"
+              except Exception as exc:
+                  return None, url, f"camoufox_error:{type(exc).__name__}"
+
+          def _patched_render(url, *args, **kwargs):
+              for i, val in enumerate(args):
+                  if i < len(_PARAM_ORDER):
+                      kwargs.setdefault(_PARAM_ORDER[i], val)
+              try:
+                  html, final_url, method = _orig_render(url, **kwargs)
+              except Exception as exc:
+                  html, final_url, method = None, url, f"orig_error:{type(exc).__name__}"
+              if not _should_retry_stealth(html, method):
+                  return html, final_url, method
+              print(f"[SCAN-L3.5] Trying Patchright: {url[:80]}", file=sys.stderr)
+              pr_html, pr_url, pr_method = _patchright_render(url, **kwargs)
+              if not _should_retry_stealth(pr_html, pr_method):
+                  print(f"[SCAN-L3.5] OK: {url[:80]}", file=sys.stderr)
+                  return pr_html, pr_url, pr_method
+              print(f"[SCAN-L3.5-FAIL] {pr_method}: {url[:80]}", file=sys.stderr)
+              print(f"[SCAN-L4] Trying Camoufox: {url[:80]}", file=sys.stderr)
+              cf_html, cf_url, cf_method = _camoufox_render(url, **kwargs)
+              if not _should_retry_stealth(cf_html, cf_method):
+                  print(f"[SCAN-L4] OK: {url[:80]}", file=sys.stderr)
+                  return cf_html, cf_url, cf_method
+              print(f"[SCAN-L4-FAIL] {cf_method}: {url[:80]}", file=sys.stderr)
+              if html:
+                  return html, final_url, method
+              if pr_html:
+                  return pr_html, pr_url, pr_method
+              if cf_html:
+                  return cf_html, cf_url, cf_method
+              return None, url, "all_stealth_layers_failed"
+
+          monitor._render_with_playwright = _patched_render
+          print("[STEALTH] Patched _render_with_playwright — L3.5 + L4 active", file=sys.stderr)
+
+          sys.exit(monitor.main() or 0)
+          PYEOF
+          echo "[STEALTH] /tmp/stealth_runner.py created"
+
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          SCRAPINGANT_API_KEY: ${{ secrets.SCRAPINGANT_API_KEY }}
+          ALLOW_INSECURE_TLS: 'true'
+          JS_RENDER_ENABLED: 'true'
+          TESSERACT_ENABLED: 'true'
+          TESSERACT_LANG: 'hin+eng'
+          MAX_RUN_SECONDS: '6600'
+          SEND_RESERVE_SECONDS: '900'
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python /tmp/stealth_runner.py
+
+      # ══════════════════════════════════════════════════════════════════
+      # SAFETY-NET — LOG-ONLY (GitHub Actions only, NEVER Telegram)
+      #
+      # Two categories:
+      #   A) TG-FAILED: telegram_attempts > 0 but sent_at missing → delivery
+      #      never confirmed (timeout/5xx/permanent error). Retried next run.
+      #   B) STUCK: never reached Telegram (PDF/processing failed, 5+ attempts).
+      #
+      # Both logged with site_name, site_id, title, URL, and error details.
+      # ══════════════════════════════════════════════════════════════════
+      - name: Safety-net log (GitHub Actions only, no Telegram)
+        if: always()
+        run: |
+          python - <<'PYEOF'
+          import json, sys
+          from pathlib import Path
+
+          state_path = Path("state.json")
+          if not state_path.exists():
+              print("[SAFETY-NET] No state.json — skipping")
+              sys.exit(0)
+
+          state = json.loads(state_path.read_text(encoding="utf-8"))
+          items = state.get("items", {}) or {}
+          sites = state.get("sites", {}) or {}
+
+          tg_failed = []   # delivered attempted but not confirmed
+          stuck = []       # never reached Telegram
+
+          for iid, rec in items.items():
+              if not isinstance(rec, dict):
+                  continue
+              status = rec.get("status")
+              attempts = int(rec.get("attempts", 0) or 0)
+              pdf_attempts = int(rec.get("pdf_attempts", 0) or 0)
+              tg_attempts = int(rec.get("telegram_attempts", 0) or 0)
+              sent_at = rec.get("sent_at")
+
+              # Delivered? Skip.
+              if status == "sent" or sent_at:
+                  continue
+
+              # CATEGORY A: TG attempted but not delivered
+              if tg_attempts > 0:
+                  tg_failed.append({
+                      "site_name": rec.get("site_name") or rec.get("site_id") or "?",
+                      "site_id": rec.get("site_id") or "?",
+                      "title": (rec.get("title") or "")[:140],
+                      "url": (rec.get("url") or "")[:200],
+                      "status": status,
+                      "tg_attempts": tg_attempts,
+                      "first_failed": rec.get("telegram_first_failed_at"),
+                      "next_attempt": rec.get("telegram_next_attempt_at"),
+                      "last_error": (rec.get("last_error") or "")[:250],
+                  })
+                  continue
+
+              # CATEGORY B: Never reached Telegram
+              if status == "permanent_error" or (status == "pending" and (attempts >= 5 or pdf_attempts >= 3)):
+                  stuck.append({
+                      "site_name": rec.get("site_name") or rec.get("site_id") or "?",
+                      "site_id": rec.get("site_id") or "?",
+                      "title": (rec.get("title") or "")[:140],
+                      "url": (rec.get("url") or "")[:200],
+                      "status": status,
+                      "attempts": attempts,
+                      "pdf_attempts": pdf_attempts,
+                      "pdf_method": rec.get("pdf_method"),
+                      "failure_stage": rec.get("last_failure_stage"),
+                      "failure_category": rec.get("last_failure_category"),
+                      "last_error": (rec.get("last_error") or "")[:250],
+                  })
+
+          # Log TG-FAILED first (user was already notified? no — this IS the report)
+          if tg_failed:
+              print(f"[SAFETY-NET] {len(tg_failed)} TELEGRAM-FAILED notice(s) — delivery never confirmed (GitHub only)")
+              for item in tg_failed[:30]:
+                  print(
+                      f"[SAFETY-NET] TG-FAILED "
+                      f"site={item['site_name']!r} site_id={item['site_id']} "
+                      f"title={item['title']!r} tg_attempts={item['tg_attempts']} "
+                      f"status={item['status']} "
+                      f"first_failed={item['first_failed']} "
+                      f"next_attempt={item['next_attempt']} "
+                      f"last_error={item['last_error']!r} "
+                      f"url={item['url']!r}"
+                  )
+
+          # Log STUCK
+          if stuck:
+              print(f"[SAFETY-NET] {len(stuck)} PROCESSING-STUCK item(s) — never reached Telegram (GitHub only)")
+              for item in stuck[:20]:
+                  print(
+                      f"[SAFETY-NET] STUCK "
+                      f"site={item['site_name']!r} site_id={item['site_id']} "
+                      f"title={item['title']!r} status={item['status']} "
+                      f"attempts={item['attempts']} pdf_attempts={item['pdf_attempts']} "
+                      f"stage={item['failure_stage']} category={item['failure_category']} "
+                      f"method={item['pdf_method']} "
+                      f"last_error={item['last_error']!r} "
+                      f"url={item['url']!r}"
+                  )
+
+          # Persistent site failures
+          persistent = []
+          for sid, srec in sites.items():
+              if isinstance(srec, dict):
+                  consec = int(srec.get("consecutive_failures", 0) or 0)
+                  if consec >= 10:
+                      persistent.append((sid, consec, (srec.get("last_error") or "")[:120]))
+          if persistent:
+              print(f"[SAFETY-NET] {len(persistent)} site(s) with persistent failures (GitHub only):")
+              for sid, consec, err in persistent:
+                  print(f"[SAFETY-NET] PERSISTENT-FAILURE site_id={sid} consecutive={consec} error={err!r}")
+
+          # Backlog
+          total_pending = sum(1 for r in items.values()
+                              if isinstance(r, dict) and r.get("status") == "pending")
+          if total_pending >= 200:
+              print(f"[SAFETY-NET] BACKLOG {total_pending} pending items")
+
+          print("[SAFETY-NET] Log complete. No Telegram message sent (per policy: Telegram only for actual notices).")
+          PYEOF
+
+      - name: Commit and push state.json
+        if: always()
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/heads/* ]]; then
+            echo "Refusing to push state from a non-branch ref: $GITHUB_REF" >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- state.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update university monitor state [skip ci]'
+          else
+            echo 'state.json has no staged changes.'
+          fi
+          pushed=false
+          for attempt in 1 2 3 4 5; do
+            echo "State push attempt ${attempt}/5"
+            git fetch origin "$TARGET_BRANCH"
+            git reset --hard HEAD
+            if ! git rebase "origin/$TARGET_BRANCH"; then
+              git rebase --abort || true
+              if [[ "$attempt" -eq 5 ]]; then
+                echo 'Could not rebase state commit after 5 attempts.' >&2
+                exit 1
+              fi
+              sleep 5
+              continue
+            fi
+            if git push origin "HEAD:refs/heads/$TARGET_BRANCH"; then
+              pushed=true
+              break
+            fi
+            if [[ "$attempt" -lt 5 ]]; then sleep 5; fi
+          done
+          if [[ "$pushed" != true ]]; then
+            echo 'ERROR: state.json was not persisted to the repository.' >&2
+            exit 1
+          fi
